@@ -1,0 +1,7 @@
+{
+  "_说明": "复制本文件为 reader_config.json 即可生效；所有键都可省略，省略时使用默认值。",
+  "pdf_root_dir": "D:/PDF",
+  "state_dir": null,
+  "initial_pdf_keyword": "",
+  "initial_page": 1
+}

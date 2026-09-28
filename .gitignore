@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 本地配置（含个人路径，不要发布）
+reader_config.json
+
+# 测试/调试产生的临时文件
+_tmp_*.pdf
+_test_tmp*/
+_smoke*.pdf
+_bench*/
+*.log
+
+# 改动前的本地备份（已由 git 历史取代，仅留本机）
+_backup/
+
+# 编辑器
+.vscode/
+.idea/
