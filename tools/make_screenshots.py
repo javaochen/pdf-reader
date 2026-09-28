@@ -23,7 +23,27 @@ os.makedirs(TMP, exist_ok=True)
 os.makedirs(OUT, exist_ok=True)
 os.environ["PDF_READER_PDF_ROOT_DIR"] = TMP
 os.environ["PDF_READER_STATE_DIR"] = TMP
+# 速记文件必须指到临时目录：否则截图会读到（并可能显示）用户真实的速记内容
+os.environ["PDF_READER_NOTES_FILE"] = os.path.join(TMP, "sample-notes.md")
 sys.path.insert(0, PKG)
+
+# 截图里速记栏所示的样例内容（原创，正好演示"位置标记 + 自己的疑问"这种用法）
+SAMPLE_NOTES = """# 第 3 章 中值定理
+
+## 拉格朗日（定理 3.4）
+- 条件：闭区间连续 + 开区间可导，两个条件缺一不可
+- 结论：f(b) − f(a) = f'(ξ)(b − a)
+- 它是罗尔定理的「倾斜版」：把弦转平就回到罗尔
+
+--- sample-math-book.pdf · 第 1 页 · 2026-09-28 21:40 ---
+疑问：ξ 唯一吗？→ 不唯一，只保证「至少存在一点」
+反例：f(x) = x³ 在 [−1, 1] 上，ξ = 0 是唯一的
+
+--- sample-math-book.pdf · 第 4 页 · 2026-09-28 21:58 ---
+柯西中值定理把分母换成了 g(b) − g(a)
+"""
+with open(os.environ["PDF_READER_NOTES_FILE"], "w", encoding="utf-8") as _f:
+    _f.write(SAMPLE_NOTES)
 
 import fitz
 from PySide6.QtCore import QRectF, Qt, QTimer
@@ -169,8 +189,9 @@ book = make_book(os.path.join(TMP, "sample-math-book.pdf"))
 # ---------------- 截图 ----------------
 win = R.MainWindow()
 win.setAttribute(Qt.WA_DontShowOnScreen, True)   # 正常布局/绘制，但不上屏
-win.resize(1360, 880)
+win.resize(1500, 900)
 win.show()
+win.splitter.setSizes([190, 900, 410])       # 左：书签　中：页面　右：速记
 win.open_pdf(book, 1)
 app.processEvents()
 QTest.qWait(250)

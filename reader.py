@@ -5,13 +5,16 @@ import math
 import os
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
 import fitz  # PyMuPDF
 import numpy as np
-from PySide6.QtCore import Qt, QRect, QPoint, Signal, QEvent, QTimer, QThreadPool, QRunnable, Slot
+from PySide6.QtCore import (
+    Qt, QRect, QPoint, QUrl, Signal, QEvent, QTimer, QThreadPool, QRunnable, Slot,
+)
 from PySide6.QtGui import (
     QImage,
     QKeySequence,
@@ -20,9 +23,11 @@ from PySide6.QtGui import (
     QPainter,
     QPen,
     QColor,
+    QDesktopServices,
     QGuiApplication,
     QIcon,
     QFont,
+    QTextCursor,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -36,6 +41,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSpinBox,
@@ -132,6 +138,23 @@ except (TypeError, ValueError):
     INITIAL_PAGE = 1
 HISTORY_FILE_NAME = ".pdf_reader_history.json"
 RECENT_FILE_NAME = ".pdf_reader_recent.json"
+
+
+def resolve_notes_path(raw) -> Path:
+    """速记文件路径：相对路径按程序目录解析，支持 ~ 展开。
+
+    默认放在程序目录下（跟着包走，拷走整个文件夹速记也跟着走）；
+    想放别处就在配置里给绝对路径或相对程序目录的路径。
+    """
+    p = Path(str(raw)).expanduser()
+    return p if p.is_absolute() else (APP_DIR / p)
+
+
+# 右侧速记栏（输入即存）
+NOTES_PATH = resolve_notes_path(_cfg("notes_file", "notes.md"))
+NOTES_SAVE_DEBOUNCE_MS = 800          # 停止输入多久后落盘
+NOTES_MAX_BYTES = 2 * 1024 * 1024     # 加载上限：误指向超大文件时也不至于卡死界面
+
 # 图标优先用包内 assets/reader.ico（随包发布）；缺失时返回空串，使用 Qt 默认图标
 ICON_PATH = str(ASSETS_DIR / "reader.ico") if (ASSETS_DIR / "reader.ico").is_file() else ""
 HISTORY_VERSION = 3
@@ -624,6 +647,11 @@ class HelpDialog(QDialog):
             "9. 自动裁剪渲染（默认关闭）\n"
             "   - 开启后渲染前自动切除白边与空白间距\n"
             "   - 含扫描墨点过滤与灰底自适应，Ctrl+Shift+R 或命令面板中开关\n"
+            "10. 速记（右侧栏）\n"
+            "   - Ctrl+N 显示/隐藏右侧速记栏\n"
+            "   - 输入停止后自动保存到程序目录下的 notes.md（纯 markdown 源码）\n"
+            "   - 「插入位置」按钮记下当前书名与页码；「打开文件」用系统程序打开该 md\n"
+            "   - 路径可在配置里用 notes_file 改成别的文件（支持绝对路径）\n"
         )
         layout.addWidget(text)
         btn = QPushButton("关闭")
@@ -898,6 +926,162 @@ class BookmarkPanel(QWidget):
         page = item.data(0, Qt.UserRole)
         if page:
             self.on_jump_to_page(page)
+
+
+class NotesPanel(QWidget):
+    """右侧速记栏：边看书边写，停止输入后自动落盘到一个 md 文件。
+
+    刻意保持简单——**单个 md 文件、纯 markdown 源码、不做渲染**：先确认这个面板
+    在日常阅读里真的会被用到，再考虑多速记文件或公式渲染。
+
+    - 写盘用"临时文件 + 替换"，中途崩溃不会把原文件截断成半截
+    - 写盘防抖（NOTES_SAVE_DEBOUNCE_MS），关窗时 flush 兜底，不会丢字
+    - 写失败不静默：状态行变红并写日志（例如程序目录只读）
+    """
+
+    def __init__(self, path: Path, context_provider=None, parent=None):
+        super().__init__(parent)
+        self.path = Path(path)
+        self.context_provider = context_provider
+        self._dirty = False
+        self._last_error = ""
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+
+        self.title = QLabel("速记")
+        self.title.setStyleSheet("font-weight: bold;")
+        self.title.setToolTip(f"自动保存到：{self.path}")
+        layout.addWidget(self.title)
+
+        self.editor = QPlainTextEdit()
+        self.editor.setPlaceholderText(
+            "在这里写速记，停止输入后自动保存到 md 文件。\n\n"
+            "点「插入位置」记下当前书名与页码，方便回溯原文。"
+        )
+        self.editor.setFont(QFont("Consolas", 10))
+        self.editor.textChanged.connect(self._on_text_changed)
+        layout.addWidget(self.editor, 1)
+
+        row = QHBoxLayout()
+        row.setSpacing(4)
+        self.btn_marker = QPushButton("插入位置")
+        self.btn_marker.setFocusPolicy(Qt.NoFocus)
+        self.btn_marker.clicked.connect(self.insert_location_marker)
+        self.btn_open = QPushButton("打开文件")
+        self.btn_open.setFocusPolicy(Qt.NoFocus)
+        self.btn_open.clicked.connect(self._open_file_externally)
+        row.addWidget(self.btn_marker)
+        row.addWidget(self.btn_open)
+        row.addStretch(1)
+        layout.addLayout(row)
+
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        self.status.setStyleSheet("color: gray;")
+        layout.addWidget(self.status)
+
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(NOTES_SAVE_DEBOUNCE_MS)
+        self._save_timer.timeout.connect(self.save)
+
+        self.load()
+
+    # ---- 读写 ----
+    def load(self):
+        """把已有速记读进编辑器（超过上限则截断，避免超大文件卡住界面）。"""
+        self.editor.blockSignals(True)
+        try:
+            if self.path.is_file():
+                size = self.path.stat().st_size
+                with open(self.path, "r", encoding="utf-8", errors="replace") as f:
+                    text = f.read(NOTES_MAX_BYTES + 1)
+                truncated = len(text) > NOTES_MAX_BYTES
+                self.editor.setPlainText(text[:NOTES_MAX_BYTES])
+                if truncated:
+                    self._set_status(f"文件超过 {NOTES_MAX_BYTES // 1024} KB，只载入了前一部分", error=True)
+                else:
+                    self._set_status(f"已载入 {size / 1024:.1f} KB")
+            else:
+                self.editor.setPlainText("")
+                self._set_status("新文件，输入后自动创建")
+            self._dirty = False
+        except OSError as e:
+            log.warning("读取速记文件失败：%s（%s）", self.path, e)
+            log.debug("读取速记文件失败详情", exc_info=True)
+            self._set_status(f"读取失败：{e}", error=True)
+        finally:
+            self.editor.blockSignals(False)
+
+    def save(self, force: bool = False) -> bool:
+        """写盘。默认只在有改动时写；force=True 用于关窗兜底。"""
+        self._save_timer.stop()
+        if not self._dirty and not force:
+            return True
+        text = self.editor.toPlainText()
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+            os.replace(tmp, self.path)          # 原子替换：崩溃不会留下半截文件
+        except OSError as e:
+            # 用户可见的一行 + 详细堆栈留给 DEBUG，避免无控制台的窗口应用刷一屏
+            log.warning("写入速记文件失败：%s（%s）", self.path, e)
+            log.debug("写入速记文件失败详情", exc_info=True)
+            self._set_status(f"保存失败：{e}", error=True)
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return False
+        self._dirty = False
+        self._set_status(f"已保存 {time.strftime('%H:%M:%S')} · {len(text) / 1024:.1f} KB")
+        return True
+
+    def flush(self) -> bool:
+        """关窗/退出前调用：立刻落盘，撤掉尚未触发的防抖。"""
+        return self.save(force=self._dirty or self._save_timer.isActive())
+
+    # ---- 交互 ----
+    def insert_location_marker(self):
+        """在光标处插入一行位置标记（书名 + 页码 + 时间），便于回溯原文。"""
+        name, page = "未打开文件", 0
+        if self.context_provider:
+            try:
+                name, page = self.context_provider()
+            except Exception:
+                log.debug("取速记上下文失败", exc_info=True)
+        marker = f"\n--- {name} · 第 {page} 页 · {time.strftime('%Y-%m-%d %H:%M')} ---\n"
+        cur = self.editor.textCursor()
+        # 空文档或光标已在行首时不留空行；在行中间插入则先换行，让标记自成一段
+        if not self.editor.toPlainText() or cur.positionInBlock() == 0:
+            marker = marker.lstrip("\n")
+        cur.insertText(marker)
+        self.editor.setTextCursor(cur)
+        self.editor.setFocus()
+
+    def _open_file_externally(self):
+        if not self.path.is_file():
+            self.save(force=True)
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.path))):
+            self._set_status(f"无法用系统程序打开：{self.path}", error=True)
+
+    def _on_text_changed(self):
+        if not self._dirty:
+            self._dirty = True
+            self._set_status("正在输入…")
+        self._save_timer.start()
+
+    def _set_status(self, text: str, error: bool = False):
+        self._last_error = text if error else ""
+        self.status.setText(text)
+        self.status.setStyleSheet("color: #c0392b;" if error else "color: gray;")
+
+    @property
+    def is_dirty(self) -> bool:
+        return self._dirty
 
 
 class CropOverlay(QWidget):
@@ -2254,13 +2438,16 @@ class MainWindow(QMainWindow):
         )
 
         self.bookmark_panel = BookmarkPanel(self.jump_to_page, self._nav_bookmark)
+        self.notes_panel = NotesPanel(NOTES_PATH, context_provider=self.notes_context)
 
         self.splitter = QSplitter()
         self.splitter.addWidget(self.bookmark_panel)
         self.splitter.addWidget(self.viewer)
+        self.splitter.addWidget(self.notes_panel)
         self.splitter.setStretchFactor(0, 1)
-        self.splitter.setStretchFactor(1, 4)
-        self.splitter.setSizes([320, 960])
+        self.splitter.setStretchFactor(1, 5)
+        self.splitter.setStretchFactor(2, 1)
+        self.splitter.setSizes([280, 900, 320])
 
         self._build_ui()
         self._setup_shortcuts()
@@ -2329,6 +2516,7 @@ class MainWindow(QMainWindow):
         ("Ctrl+Shift+B",   "复制书签",      "复制当前PDF书签到剪贴板",       "copy_pdf_bookmarks"),
         ("F5",             "刷新文件",      "重新扫描PDF目录",               "refresh_files"),
         ("Ctrl+Shift+R",   "自动裁剪渲染",  "开关渲染前去白边/空白间距",     "toggle_auto_crop_mode"),
+        ("Ctrl+N",         "速记栏",        "显示/隐藏右侧速记栏（自动存 md）", "toggle_notes_panel"),
         ("Ctrl+/",         "快捷键列表",    "查看所有快捷键",                "show_shortcuts"),
     ]
 
@@ -2340,6 +2528,8 @@ class MainWindow(QMainWindow):
         ("原始大小",        "缩放到 100%",                      "viewer.zoom_to_100"),
         ("适应页面开关",    "在 适合页面/适合宽度 之间切换",     "toggle_fit_page_mode"),
         ("显示/隐藏书签栏", "切换左侧书签面板",                 "toggle_bookmark_panel"),
+        ("显示/隐藏速记栏", "切换右侧速记面板",                 "toggle_notes_panel"),
+        ("插入位置标记",    "在速记里记下当前书名与页码",       "notes_insert_marker"),
         ("使用帮助",        "查看使用说明",                     "show_help"),
     ]
 
@@ -2611,6 +2801,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._flush_state()
+        self.notes_panel.flush()      # 速记未落盘的改动（防抖未触发）在关窗前补齐
         super().closeEvent(event)
 
     def on_page_changed(self, path: str, page_1_based: int):
@@ -2658,6 +2849,25 @@ class MainWindow(QMainWindow):
         self.bookmark_panel.setVisible(not self.bookmark_panel.isVisible())
         if self.bookmark_panel.isVisible():
             self.refresh_bookmarks()
+
+    # ---- 速记 ----
+    def notes_context(self):
+        """给速记面板提供"当前在哪"：书名 + 页码。"""
+        path = getattr(self.viewer, "current_path", None)
+        name = os.path.basename(path) if path else "未打开文件"
+        page = self.viewer.current_page_1_based() if path else 0
+        return name, page
+
+    def toggle_notes_panel(self):
+        self.notes_panel.setVisible(not self.notes_panel.isVisible())
+        if self.notes_panel.isVisible():
+            self.notes_panel.editor.setFocus()
+
+    def notes_insert_marker(self):
+        if not self.notes_panel.isVisible():
+            self.notes_panel.setVisible(True)
+        self.notes_panel.insert_location_marker()
+        self.status.showMessage(f"已插入位置标记（速记自动保存到 {NOTES_PATH}）")
 
 
 def main():

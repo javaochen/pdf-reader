@@ -236,8 +236,8 @@ check("9.7 跳页后回车完成截取", not pm.isNull() and pm.height() > 0,
 
 # 坐标映射正确性（旧实现 label.mapTo(overlay) 用错了父控件，坐标是错的）
 # 不变式：滚动多少，页面原点就移动多少（旧实现原点是死值，不随滚动变化）
-# 用"适合宽度"制造比视口高的页面，这样才有可能真正滚动
-viewer.fit_width()
+# 用固定放大制造"页面大于视口"，这样一定可滚动（不依赖窗口/分栏宽度）
+viewer._set_zoom(3.0)
 app.processEvents()
 QTest.qWait(80)
 app.processEvents()

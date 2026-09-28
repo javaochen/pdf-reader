@@ -39,7 +39,7 @@
 | 图像算法 | `rgb_to_gray`、`content_row_col_hits`、`find_content_bbox_arr`、`estimate_background_level`、`adaptive_white_threshold`、`qimage_to_rgb_array`、`safe_crop_box` |
 | 持久化 | `HistoryStore`（最后页码）、`RecentStore`（最近打开）：脏标记 + 防抖落盘 + 损坏文件可见报错 |
 | 对话框 | `ShortcutListDialog`、`HelpDialog`、`BookmarkCopyDialog`、`QuickSwitchDialog`、`JumpPageDialog`、`CommandDialog` |
-| 界面部件 | `BookmarkPanel`、`CropOverlay`（截取/遮挡覆盖层）、`PdfViewer`（渲染 + 缓存 + 截取）、`MainWindow`（快捷键/命令注册、状态落盘） |
+| 界面部件 | `BookmarkPanel`、`NotesPanel`（右侧速记，自动落盘）、`CropOverlay`（截取/遮挡覆盖层）、`PdfViewer`（渲染 + 缓存 + 截取）、`MainWindow`（快捷键/命令注册、状态落盘） |
 | 后台任务 | `_PrefetchTask`（QRunnable，只产出 QImage，QPixmap 回主线程） |
 
 关键约定：
@@ -62,6 +62,7 @@
 | 视图模式 | 适合页面 / 适合宽度 / 手动；页面大于视口时把标签最小尺寸抬到页面尺寸，滚动条范围才正确（见"已知限制"） |
 | 页面缓存 | 条目数 + 总字节数双重上限（默认 256 MB），截取产生的高分辨率位图不进缓存 |
 | 防抖 | 滚轮缩放、窗口尺寸变化合并为一次渲染；阅读进度落盘合并为一次写入 |
+| 速记落盘 | 停止输入 800 ms 后写盘（`NOTES_SAVE_DEBOUNCE_MS`），关窗 `flush()` 兜底；写盘走"临时文件 + `os.replace`"原子替换，崩溃不会把笔记截成半截；载入限 2 MB、写失败在面板状态行标红而不是静默 |
 | 上限保护 | 单次跨页截取最多 50 页、输出最多 2 亿像素，超限直接提示而不是拼出 GB 级位图 |
 
 ## 实测数据
@@ -96,13 +97,14 @@
 
 ## 测试
 
-四套无头回归测试，**不需要显示器**（自动用 Qt `offscreen` 平台），共 99 项。
-测试会把 PDF 目录与状态目录指向包内临时目录，不会扫描或写入用户的真实下载目录。
+五套无头回归测试，**不需要显示器**（自动用 Qt `offscreen` 平台），共 124 项。
+测试会把 PDF 目录、状态目录与速记文件都指向包内临时目录，不会扫描或写入用户的真实下载目录与真实速记。
 
 ```bash
 python tests/test_crop_loop.py         # 截取模式循环 + 跳页后仍可用（34 项）
 python tests/test_capture_autocrop.py  # 截取/自动裁剪/缓存/防抖/上限（29 项）
 python tests/test_math_reading.py      # 原生分辨率/抗噪阈值/预取/视图模式（24 项）
+python tests/test_notes.py             # 速记自动落盘/防抖/位置标记/失败不静默（25 项）
 python tests/test_nav.py               # 书签相对导航（12 例）
 ```
 
@@ -118,6 +120,8 @@ python tests/test_nav.py               # 书签相对导航（12 例）
 - 预取结果在缓存清空后不回填；回到已渲染页不额外栅格化
 - 适合宽度铺满视口；**标签长到页面尺寸、可滚动范围覆盖整页、滚到底页面底部可达**；非法标记不会让绘制崩溃
 - 跳页后覆盖层重新拿到键盘焦点；换页清空残留预览线；焦点在别处时回车仍能确认分割线
+- 速记：防抖到期才落盘、`flush()`（关窗）不丢未落盘的改动、位置标记自成一行、超大文件截断载入、
+  写入失败不抛异常且状态可见、不留 `.tmp` 残留
 
 ## 打包发布
 
@@ -149,7 +153,9 @@ python tools/make_screenshots.py        # 输出到 docs/screenshots/
   （功能均由快捷键与命令面板覆盖），属于死 UI，可直接删除或接上工具栏
 - 无文本层，因此没有搜索/选中复制；有文本层的数字版 PDF 也尚未利用 `get_text`
 - 书签面板不支持输入过滤；几百上千条目录的书只能滚动查找
-- 连续滚动（长图模式）、双页对开、笔记/标记导出现在都没有，只有页码级进度
+- 速记目前是**单文件 + 纯 markdown 源码**（不渲染公式、不按书拆分）：这是刻意的第一步，
+  先用起来看是否真的在用，再决定要不要多文件（按书/按章）与公式渲染
+- 连续滚动（长图模式）、双页对开、笔记导出到现在都没有，只有页码级进度
 
 ## 本地集成
 
