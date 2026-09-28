@@ -8,6 +8,7 @@
 import os
 import shutil
 import sys
+import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -192,5 +193,15 @@ print("=" * 78)
 for name in FAIL:
     print("  FAILED:", name)
 
-shutil.rmtree(TMP, ignore_errors=True)
+# 清理临时目录：Windows 上文档句柄没释放会让 rmtree 静默失败，所以先关文档再重试
+try:
+    if win.viewer.doc is not None:
+        win.viewer.clear_pdf()
+except Exception:
+    pass
+for _ in range(5):
+    shutil.rmtree(TMP, ignore_errors=True)
+    if not os.path.exists(TMP):
+        break
+    time.sleep(0.2)
 sys.exit(1 if FAIL else 0)

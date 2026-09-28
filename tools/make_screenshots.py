@@ -13,6 +13,7 @@
 import os
 import shutil
 import sys
+import time
 
 os.environ.pop("QT_QPA_PLATFORM", None)      # 用系统默认平台
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -267,5 +268,16 @@ QTest.qWait(200)
 shoot(win, "05-invert.png", 1200)
 
 win.close()
-shutil.rmtree(TMP, ignore_errors=True)
+app.processEvents()
+# Windows 上文档句柄没释放会让 rmtree 静默失败：先关文档，再重试几次
+try:
+    if win.viewer.doc is not None:
+        win.viewer.clear_pdf()
+except Exception:
+    pass
+for _ in range(5):
+    shutil.rmtree(TMP, ignore_errors=True)
+    if not os.path.exists(TMP):
+        break
+    time.sleep(0.2)
 print("完成 →", OUT)
