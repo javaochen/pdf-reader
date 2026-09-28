@@ -185,3 +185,7 @@ pyinstaller --noconfirm --windowed --name PDF阅读器 --icon assets/reader.ico 
 ## 从上层 `launcher.py` 启动
 
 上级目录的 `launcher.py` 已把本包登记为目标脚本（`pdf_reader/reader.py`），可在其中统一查看、暂停、重启。
+
+## 许可
+
+MIT License，见 [LICENSE](LICENSE)。
