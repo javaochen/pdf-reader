@@ -18,6 +18,18 @@
 > 截取模式刻意只做**两条横线 + 跨页拼接 + 原生分辨率无损输出**，与 PixPin 之类外部截图工具互补；
 > 任意矩形框选交给外部工具，这里专做外部工具做不到的事。
 
+## 界面截图
+
+| 阅读：适合宽度 + 书签目录 | 循环截取：红=起始线　蓝=结束线　绿=预览线 |
+|---|---|
+| ![阅读](docs/screenshots/01-reading.png) | ![截取模式](docs/screenshots/02-capture-mode.png) |
+
+| 放大看公式（3×，可拖拽平移） | 快捷键一览（`Ctrl+/`） |
+|---|---|
+| ![放大](docs/screenshots/04-zoom-formula.png) | ![快捷键](docs/screenshots/03-shortcuts.png) |
+
+> 截图取自程序真实界面，样例书为原创排版内容。
+
 ## 目录结构
 
 ```
@@ -26,14 +38,16 @@ pdf_reader/
 ├─ requirements.txt             # 运行依赖
 ├─ reader_config.example.json   # 配置模板（复制为 reader_config.json 生效）
 ├─ run.bat                      # Windows 双击启动
+├─ LICENSE                      # MIT
 ├─ assets/
 │  └─ reader.ico                # 窗口图标
+├─ docs/screenshots/            # README 截图
 ├─ tests/
 │  ├─ test_crop_loop.py         # 截取模式循环行为
 │  ├─ test_capture_autocrop.py  # 截取/自动裁剪/缓存/防抖
 │  ├─ test_math_reading.py      # 原生分辨率/抗噪阈值/预取/视图模式
 │  └─ test_nav.py               # 书签相对导航
-└─ _backup/                     # 改动前的时间戳备份（可删）
+└─ _backup/                     # 改动前的时间戳备份（已 gitignore，可删）
 ```
 
 ## 性能与实现要点
@@ -107,12 +121,17 @@ copy reader_config.example.json reader_config.json    # Windows
 
 | 键 | 环境变量 | 默认值 | 说明 |
 |---|---|---|---|
-| `pdf_root_dir` | `PDF_READER_PDF_ROOT_DIR` | 用户「下载」文件夹 | 启动时扫描/打开的 PDF 目录 |
+| `pdf_root_dir` | `PDF_READER_PDF_ROOT_DIR` | 系统「下载」文件夹 | 启动时扫描/打开的 PDF 目录 |
 | `state_dir` | `PDF_READER_STATE_DIR` | 同 `pdf_root_dir` | 阅读进度、最近打开记录的存放目录 |
 | `initial_pdf_keyword` | `PDF_READER_INITIAL_PDF_KEYWORD` | 空 | 启动时按文件名关键字自动打开 |
 | `initial_page` | `PDF_READER_INITIAL_PAGE` | `1` | 无历史记录时的起始页 |
 
+**默认目录是运行时算出来的**，仓库里不含任何机器路径：Windows 先读注册表里系统认定的
+「下载」文件夹（被用户在资源管理器里"移动位置"过也能找到），拿不到再依次退回
+`~/Downloads` → `~/Documents` → 用户主目录。因此把这个包拷到别人机器上，它会落到**那个人自己**的下载目录。
+
 进度文件：`.pdf_reader_history.json`、`.pdf_reader_recent.json`（位于 `state_dir`）。
+默认 `state_dir` 与 `pdf_root_dir` 相同（即写进下载目录）；想放到别处就在配置里指定 `state_dir`。
 
 ## 快捷键
 

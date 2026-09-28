@@ -11,6 +11,7 @@ _tmp_*.pdf
 _test_tmp*/
 _smoke*.pdf
 _bench*/
+_shots_tmp/
 *.log
 
 # 改动前的本地备份（已由 git 历史取代，仅留本机）
@@ -19,3 +20,6 @@ _backup/
 # 编辑器
 .vscode/
 .idea/
+
+# 临时调试目录
+_dbg_*/

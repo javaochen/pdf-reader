@@ -171,6 +171,12 @@ print("=" * 78)
 viewer.set_auto_crop_enabled(False)
 viewer.goto_page(1)
 app.processEvents()
+# 关键：用固定缩放 + 落在像素网格上的边界。
+# clip 渲染的像素原点是对齐到"裁剪矩形"的，若 边界(页面点) × scale 不是整数，
+# 输出会相对整页渲染有亚像素位移，逐像素比对必然不等（这与实现正确性无关）。
+# 1.0 缩放时 120pt × (300/72) = 500px、240pt × (300/72) = 1000px，都是整数。
+viewer._set_zoom(1.0)
+app.processEvents()
 z = viewer._get_effective_zoom(0)
 
 
@@ -187,7 +193,7 @@ def reference_rows(page_index, y1, y2):
     return img.copy(QRect(0, y1_px, img.width(), y2_px - y1_px))
 
 
-for tag, (pa, y1), (pb, y2) in [("单页条带", (0, 80), (0, 300)), ("跨页 (0→2)", (0, 80), (2, 300))]:
+for tag, (pa, y1), (pb, y2) in [("单页条带", (0, 120), (0, 240)), ("跨页 (0→2)", (0, 120), (2, 240))]:
     if pa == pb:
         new = viewer._crop_lossless_region(pa, y1, y2).toImage()
         ref = reference_rows(pa, y1, y2)
@@ -243,6 +249,9 @@ print()
 print("=" * 78)
 print("4. 适应页面：一次渲染即精确适配，内容框只探测一次")
 print("=" * 78)
+# 第 2 节为了对齐像素网格设成了固定缩放，这里恢复"适应页面"模式
+viewer.fit_page()
+app.processEvents()
 for autocrop in (False, True):
     viewer.set_auto_crop_enabled(autocrop)
     with no_prefetch(viewer):

@@ -95,8 +95,33 @@ def _cfg(key: str, default):
     return default if value in (None, "") else value
 
 
-# PDF 扫描/打开目录：默认用户自己的“下载”文件夹
-PDF_ROOT_DIR = str(_cfg("pdf_root_dir", Path.home() / "Downloads"))
+def default_downloads_dir() -> Path:
+    """默认 PDF 目录：系统认定的「下载」文件夹 → ~/Downloads → ~/Documents → 主目录。
+
+    发布出去的程序不能写死任何机器路径，所以默认值在运行时算出来：Windows 先问
+    注册表里的已知文件夹（用户在资源管理器里把"下载"搬家后，只有注册表知道新位置，
+    ~/Downloads 可能根本不存在），拿不到再退回常见位置。非 Windows 直接用 ~/Downloads。
+    """
+    if sys.platform == "win32":
+        try:
+            import winreg
+            key = r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key) as hkey:
+                raw, _ = winreg.QueryValueEx(hkey, "{374DE290-123F-4565-9164-39C4925E467B}")
+            # 注册表里常存 %USERPROFILE%\Downloads 这类未展开的值
+            known = Path(os.path.expandvars(str(raw)))
+            if known.is_dir():
+                return known
+        except Exception:
+            log.debug("读取系统「下载」文件夹失败，退回 ~/Downloads", exc_info=True)
+    for candidate in (Path.home() / "Downloads", Path.home() / "Documents"):
+        if candidate.is_dir():
+            return candidate
+    return Path.home()
+
+
+# PDF 扫描/打开目录：默认用户自己的「下载」文件夹（运行时计算，不含机器路径）
+PDF_ROOT_DIR = str(_cfg("pdf_root_dir", default_downloads_dir()))
 # 阅读进度等状态文件目录：默认与 PDF_ROOT_DIR 相同（保持旧行为）
 STATE_DIR = str(_cfg("state_dir", PDF_ROOT_DIR))
 INITIAL_PDF_KEYWORD = str(_cfg("initial_pdf_keyword", ""))
@@ -544,13 +569,21 @@ class ShortcutListDialog(QDialog):
     @staticmethod
     def _describe_key(key_qt) -> str:
         mapping = {
-            Qt.Key_Left:  "← (Left)",
-            Qt.Key_Right: "→ (Right)",
-            Qt.Key_Home:  "Home",
-            Qt.Key_End:   "End",
-            Qt.Key_Escape:"Esc",
+            Qt.Key_Left:   "← (Left)",
+            Qt.Key_Right:  "→ (Right)",
+            Qt.Key_Up:     "↑ (Up)",
+            Qt.Key_Down:   "↓ (Down)",
+            Qt.Key_Home:   "Home",
+            Qt.Key_End:    "End",
+            Qt.Key_Escape: "Esc",
+            Qt.Key_Return: "Enter",
+            Qt.Key_Enter:  "小键盘 Enter",
+            Qt.Key_Space:  "Space",
+            Qt.Key_Backspace: "Backspace",
+            Qt.Key_Delete: "Delete",
         }
-        return mapping.get(key_qt, str(key_qt))
+        # 没有映射的键以前直接 str() 出枚举数字（16777220 之类），这里兜底成人能读的形式
+        return mapping.get(key_qt, QKeySequence(key_qt).toString() or str(key_qt))
 
 
 class HelpDialog(QDialog):
@@ -1049,6 +1082,20 @@ class CropOverlay(QWidget):
         else:
             super().keyPressEvent(event)
 
+    def _visible_marker_y(self, marker) -> Optional[float]:
+        """标记在本页可见时返回它的页面内纵坐标，否则 None。
+
+        历史上 paintEvent 直接解包 (page, y) 就算 y，一旦拿到 y=None 的脏数据
+        会在绘制里抛 TypeError（Qt 覆盖方法里抛异常不会中断程序，但会刷一堆
+        "active painter" 报错并让覆盖层画不出来），所以这里统一做防御。
+        """
+        if not marker or len(marker) != 2:
+            return None
+        page_index, y = marker
+        if y is None or page_index != self.viewer.current_page_index:
+            return None
+        return y
+
     def paintEvent(self, event):
         if not self.active:
             return
@@ -1066,17 +1113,15 @@ class CropOverlay(QWidget):
             painter.setPen(QPen(QColor(0, 255, 0, 200), 2, Qt.DashLine))
             painter.drawLine(0, y0 + self.preview_y, self.width(), y0 + self.preview_y)
 
-        if self.top_marker is not None:
-            top_page, top_y = self.top_marker
-            if top_page == self.viewer.current_page_index:
-                painter.setPen(QPen(QColor(255, 0, 0, 220), 2))
-                painter.drawLine(x0, y0 + top_y, x0 + pm_w, y0 + top_y)
+        top_y = self._visible_marker_y(self.top_marker)
+        if top_y is not None:
+            painter.setPen(QPen(QColor(255, 0, 0, 220), 2))
+            painter.drawLine(x0, y0 + top_y, x0 + pm_w, y0 + top_y)
 
-        if self.bottom_marker is not None:
-            bottom_page, bottom_y = self.bottom_marker
-            if bottom_page == self.viewer.current_page_index:
-                painter.setPen(QPen(QColor(0, 0, 255, 220), 2))
-                painter.drawLine(x0, y0 + bottom_y, x0 + pm_w, y0 + bottom_y)
+        bottom_y = self._visible_marker_y(self.bottom_marker)
+        if bottom_y is not None:
+            painter.setPen(QPen(QColor(0, 0, 255, 220), 2))
+            painter.drawLine(x0, y0 + bottom_y, x0 + pm_w, y0 + bottom_y)
 
         # ----- 遮挡区域 -----
         if self.cover_y is not None:
@@ -1186,7 +1231,10 @@ class PdfViewer(QWidget):
         self.image_label = QLabel("请打开一个 PDF")
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setStyleSheet("background: #202020; color: white;")
-        self.image_label.setMinimumSize(800, 600)
+        # 占位下限；有页面时按页面尺寸抬高（见 _fit_label_to_pixmap）。
+        # 旧代码写死 800x600：页面比视口大时标签不跟着长，QScrollArea 得不到可滚动
+        # 范围，页面被居中裁掉两端且滚不到（适合宽度/放大阅读都会踩到）。
+        self.image_label.setMinimumSize(320, 240)
 
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
@@ -1580,6 +1628,9 @@ class PdfViewer(QWidget):
         self.current_path = None
         self.current_page_index = 0
         self.image_label.setPixmap(QPixmap())
+        # 没有页面了，缩回占位下限（否则上一次的页面尺寸会撑出多余滚动条）
+        self.image_label.setMinimumSize(320, 240)
+        self.image_label.resize(320, 240)
         self.image_label.setText("请打开一个 PDF")
         self.update_status()
 
@@ -1873,6 +1924,21 @@ class PdfViewer(QWidget):
         return (f"{os.path.basename(self.current_path)} | 第 {self.current_page_1_based()} / "
                 f"{self.total_pages()} 页 | {fit_text} | {crop_text}")
 
+    def _fit_label_to_pixmap(self, pixmap: QPixmap):
+        """把页面标签的最小尺寸设为页面逻辑尺寸，让 QScrollArea 能滚动整页。
+
+        widgetResizable=True 会把标签压回视口大小，于是"比视口大的页面"会被居中
+        裁掉两端、滚动条范围是 0 —— 滚不到、看不全。把最小尺寸抬到页面尺寸后，
+        滚动条才会给出正确的可滚动范围（页面比视口小时标签仍是视口大小，居中不变）。
+        """
+        if pixmap is None or pixmap.isNull():
+            return
+        dpr = pixmap.devicePixelRatio() or 1.0
+        w = max(1, int(round(pixmap.width() / dpr)))
+        h = max(1, int(round(pixmap.height() / dpr)))
+        self.image_label.setMinimumSize(w, h)
+        self.image_label.resize(w, h)
+
     def render_current_page(self):
         if not self.doc:
             return
@@ -1889,7 +1955,7 @@ class PdfViewer(QWidget):
                 self.update_status()
                 return
             self.image_label.setPixmap(pixmap)
-            self.image_label.adjustSize()
+            self._fit_label_to_pixmap(pixmap)
             self._sync_crop_overlay()
             self.update_status()
             # 当前页显示完就把相邻页丢到后台渲染，下一页翻页即命中缓存

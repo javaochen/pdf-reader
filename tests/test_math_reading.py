@@ -114,6 +114,9 @@ def open_viewer(path, size=(1000, 820)):
     v = R.PdfViewer(status_callback=lambda m: None)
     OPEN_VIEWERS.append(v)
     v.resize(*size)
+    # 必须 show()：未布局的窗口里 QScrollArea 不会更新滚动条范围，
+    # 会让"能否滚到页面底部"这类断言假失败（真实使用中窗口总是显示的）
+    v.show()
     v.open_pdf(path, 1)
     app.processEvents()
     return v
@@ -258,8 +261,10 @@ pix = vw.image_label.pixmap()
 dpr = pix.devicePixelRatio() or 1.0
 lw = pix.width() / dpr
 vp_size = vw.scroll.viewport().size()
-check("P3.1 适合宽度：渲染宽度铺满视口", abs(lw - (vp_size.width() - 20)) <= 3,
-      f"图宽 {lw:.0f} / 视口 {vp_size.width()}")
+check("P3.1 适合宽度：渲染宽度铺满视口",
+      abs(lw - (vp_size.width() - 20)) <= 20 and lw >= (vp_size.width() - 20) * 0.97,
+      f"图宽 {lw:.0f} / 视口 {vp_size.width()}（容差=一个滚动条宽度："
+      f"先按无滚动条算宽度，垂直滚动条出现后视口会窄一点）")
 check("P3.2 状态栏显示适合宽度", "适合宽度" in vw.status_text(), vw.status_text())
 
 vw.zoom_to_100()
@@ -271,6 +276,54 @@ vw.fit_page()
 app.processEvents()
 check("P3.4 Ctrl+0 适合页面", vw.view_mode == R.VIEW_FIT_PAGE and "适应页面" in vw.status_text(),
       vw.status_text())
+
+# P3.8/P3.9 回归：页面大于视口时必须能滚到页面底部
+# 旧实现把标签最小尺寸写死 800x600，widgetResizable 会把标签压回视口大小，
+# 于是高于视口的页面被居中裁掉上下两端，且滚动条范围是 0（滚不到、看不全）。
+vw.fit_width()
+app.processEvents()
+QTest.qWait(120)          # 等布局落定
+# 离屏平台下滚动条范围有时要等到下一次渲染才更新（真实平台即时更新），
+# 这里显式重渲一次，让断言不依赖平台时机
+vw.render_current_page()
+app.processEvents()
+QTest.qWait(120)
+app.processEvents()
+pix_w = vw.image_label.pixmap()
+dpr_w = pix_w.devicePixelRatio() or 1.0
+pm_h = pix_w.height() / dpr_w
+viewport_h = vw.scroll.viewport().height()
+vbar_w = vw.scroll.verticalScrollBar()
+check("P3.8 标签长到页面尺寸（否则整页滚不到）",
+      vw.image_label.height() + 1 >= pm_h,
+      f"标签高 {vw.image_label.height()} / 页面高 {pm_h:.0f} / 视口 {viewport_h}")
+check("P3.9 可滚动范围覆盖整页",
+      vbar_w.maximum() + 2 >= pm_h - viewport_h,
+      f"滚动范围 0~{vbar_w.maximum()} / 需要 {pm_h - viewport_h:.0f}")
+vbar_w.setValue(vbar_w.maximum())
+app.processEvents()
+QTest.qWait(80)
+app.processEvents()
+origin_w = vw.crop_overlay._label_page_origin()
+bottom_visible = bool(origin_w) and origin_w[1] + origin_w[3] <= vw.crop_overlay.height() + 2
+check("P3.10 滚到底后页面底部可达", bottom_visible,
+      f"原点 y0={origin_w[1]:.0f} 页高={origin_w[3]:.0f} 覆盖层高={vw.crop_overlay.height()}"
+      if origin_w else "取不到页面原点")
+
+# P3.11 非法标记不能让绘制崩溃（y=None / 页号不符 / 标记本身为空）
+ov_w = vw.crop_overlay
+guard_ok = (ov_w._visible_marker_y(None) is None
+            and ov_w._visible_marker_y((vw.current_page_index, None)) is None
+            and ov_w._visible_marker_y((vw.current_page_index + 5, 10)) is None
+            and ov_w._visible_marker_y((vw.current_page_index, 10)) == 10)
+ov_w.top_marker = (vw.current_page_index, None)   # 脏数据：曾经会让 paintEvent 抛 TypeError
+ov_w.bottom_marker = ("bad", "data")
+ov_w.preview_y = 20
+painted = ov_w.grab()
+ov_w.top_marker = ov_w.bottom_marker = None
+ov_w.preview_y = None
+check("P3.11 非法标记下绘制不崩溃", guard_ok and not painted.isNull(),
+      f"guard={guard_ok} 绘制结果={painted.width()}x{painted.height()}")
 
 # 双击放大（先放大到内容超出视口，才可能滚动）
 vw._set_zoom(4.0)
