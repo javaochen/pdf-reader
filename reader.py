@@ -101,6 +101,14 @@ def _cfg(key: str, default):
     return default if value in (None, "") else value
 
 
+def _cfg_bool(key: str, default: bool) -> bool:
+    """布尔配置：JSON 里写 true/false，环境变量里写 1/0、yes/no、on/off、是/否 都认。"""
+    raw = _cfg(key, default)
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in ("1", "true", "yes", "on", "y", "是", "开")
+
+
 def default_downloads_dir() -> Path:
     """默认 PDF 目录：系统认定的「下载」文件夹 → ~/Downloads → ~/Documents → 主目录。
 
@@ -165,6 +173,12 @@ HISTORY_VERSION = 3
 AUTO_CROP_DEFAULT = False
 AUTO_CROP_WHITE_THRESHOLD = 245
 AUTO_CROP_MIN_SIZE = 8
+
+# ========== 反色显示（夜间看白底扫描件）
+# 只是显示层面的配色，页面的内容框探测、自动裁剪判定、无损截取全部按原始像素走；
+# 想要每次启动就反色，在 reader_config.json 里写 "invert": true。
+INVERT_DEFAULT = False
+INVERT_ENABLED = _cfg_bool("invert", INVERT_DEFAULT)
 
 # ========== 无损截取
 # 截取时脱离屏幕显示分辨率按固定 DPI 独立渲染，但**绝不超过原图光学分辨率**：
@@ -316,6 +330,18 @@ def qimage_to_rgb_array(img: QImage) -> np.ndarray:
     if bpl == w * 3:
         return buf.reshape((h, w, 3))
     return buf.reshape((h, bpl))[:, :w * 3].reshape((h, w, 3))
+
+
+def invert_qimage(img: QImage) -> QImage:
+    """原地反色（每个通道取 255−x），保留 alpha。
+
+    只用于**显示路径**：截取输出必须保持原样，否则发给 AI 的图会变成黑底白字。
+    调用点都放在缩放下采样之后，这样处理的像素数最少。
+    """
+    if img is None or img.isNull():
+        return img
+    img.invertPixels(QImage.InvertRgb)
+    return img
 
 
 def content_bbox_from_qimage(qimg: QImage, white_threshold: int = 245,
@@ -652,6 +678,11 @@ class HelpDialog(QDialog):
             "   - 输入停止后自动保存到程序目录下的 notes.md（纯 markdown 源码）\n"
             "   - 「插入位置」按钮记下当前书名与页码；「打开文件」用系统程序打开该 md\n"
             "   - 路径可在配置里用 notes_file 改成别的文件（支持绝对路径）\n"
+            "11. 反色显示（夜间）\n"
+            "   - Ctrl+Shift+I 在白底黑字与黑底白字之间切换\n"
+            "   - 只改显示配色：自动裁剪判定、无损截取输出都保持原始像素\n"
+            "   - 想每次启动就反色：配置里写 \"invert\": true\n"
+            "   - 遮挡模式下遮挡块会自动换成浅色，避免在黑底上看不见\n"
         )
         layout.addWidget(text)
         btn = QPushButton("关闭")
@@ -1310,7 +1341,9 @@ class CropOverlay(QWidget):
         # ----- 遮挡区域 -----
         if self.cover_y is not None:
             painter.setPen(Qt.NoPen)
-            painter.setBrush(self.COVER_COLOR)
+            # 反色后页面是黑底，纯黑遮挡块会"隐身"——此时改用浅色块，让遮挡看得出来
+            painter.setBrush(QColor(255, 255, 255, 255) if self.viewer.invert_enabled
+                             else self.COVER_COLOR)
             painter.drawRect(0, y0 + self.cover_y, self.width(), self.height() - y0 - self.cover_y)
 
 
@@ -1352,6 +1385,9 @@ class _PrefetchTask(QRunnable):
             th = max(1, round(img.height() / ss))
             if (tw, th) != (img.width(), img.height()):
                 img = img.scaled(tw, th, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+            if v.invert_enabled:
+                # 与显示路径一致地反色：否则预取回来的页会在翻页时"闪"一下原色
+                img = invert_qimage(img)
             v._prefetch_ready.emit(self.gen, key, self.page_index, img, self.dpr)
         except Exception:
             log.debug("预取失败 page=%s", self.page_index, exc_info=True)
@@ -1391,6 +1427,9 @@ class PdfViewer(QWidget):
         self.auto_crop_white_threshold = AUTO_CROP_WHITE_THRESHOLD
         self.auto_crop_min_size = AUTO_CROP_MIN_SIZE
         self._last_crop_percent: Optional[int] = None
+
+        # 反色显示（只影响显示路径，见 INVERT_DEFAULT）
+        self.invert_enabled = INVERT_ENABLED
 
         # 重渲染防抖：滚轮连续缩放 / 窗口拖拽尺寸变化时合并为一次渲染
         self._pending_render = QTimer(self)
@@ -1615,6 +1654,16 @@ class PdfViewer(QWidget):
 
     def toggle_auto_crop_enabled(self):
         self.set_auto_crop_enabled(not self.auto_crop_enabled)
+
+    def set_invert_enabled(self, enabled: bool):
+        """反色显示开关。只影响显示：内容框探测、自动裁剪、无损截取都按原始像素走。"""
+        self.invert_enabled = bool(enabled)
+        # 缓存里存的是另一种配色，必须整体作废（同时让在途预取结果失效）
+        self._clear_page_cache()
+        self.render_current_page()
+
+    def toggle_invert_enabled(self):
+        self.set_invert_enabled(not self.invert_enabled)
 
     def _content_box_pt(self, page_index: int) -> Optional[Tuple[float, float, float, float]]:
         """页面内容框（页面坐标，单位 pt），带缓存；自动裁剪关闭时返回 None。
@@ -1950,7 +1999,8 @@ class PdfViewer(QWidget):
     def _prefetch_key(self, page_index: int, render_z: float) -> tuple:
         return (self.current_path, page_index, round(render_z, 4), False,
                 self.view_mode, self.auto_crop_enabled,
-                self.auto_crop_white_threshold, self.auto_crop_min_size)
+                self.auto_crop_white_threshold, self.auto_crop_min_size,
+                bool(self.invert_enabled))
 
     def _on_prefetch_ready(self, gen: int, key, page_index: int,
                            image: Optional[QImage], dpr: float):
@@ -1971,10 +2021,12 @@ class PdfViewer(QWidget):
     def _render_at_scale(self, page_index: int, z: float, ss: float, dpr: float, exact: bool) -> QPixmap:
         """渲染页面并按显示参数加工。
 
-        exact=True：无损截取路径，精确输出、不超采样、不设 DPR。
+        exact=True：无损截取路径，精确输出、不超采样、不设 DPR、**不反色**。
         exact=False：显示路径，按 z*ss*dpr 渲染，再平滑缩回逻辑尺寸并设置 DPR。
         """
         render_z = z if exact else z * ss * dpr
+        # 反色只作用于显示路径；它进缓存键，否则切换反色会拿到另一种配色的旧缓存
+        invert = bool(self.invert_enabled) and not exact
         key = (
             self.current_path,
             page_index,
@@ -1984,6 +2036,7 @@ class PdfViewer(QWidget):
             self.auto_crop_enabled,
             self.auto_crop_white_threshold,
             self.auto_crop_min_size,
+            invert,
         )
         cached = self.page_cache.get(key)
         if cached is not None:
@@ -2005,6 +2058,9 @@ class PdfViewer(QWidget):
             th = max(1, round(qimg.height() / ss))
             if (tw, th) != (qimg.width(), qimg.height()):
                 qimg = qimg.scaled(tw, th, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+            if invert:
+                # 放在缩放下采样之后：处理的像素最少（反色与缩放可交换，结果一致）
+                qimg = invert_qimage(qimg)
 
         pixmap = QPixmap.fromImage(qimg)
         if not exact:
@@ -2105,8 +2161,9 @@ class PdfViewer(QWidget):
             crop_text = f"自动裁剪 {self._last_crop_percent}%"
         else:
             crop_text = "自动裁剪开"
+        invert_text = " | 反色" if self.invert_enabled else ""
         return (f"{os.path.basename(self.current_path)} | 第 {self.current_page_1_based()} / "
-                f"{self.total_pages()} 页 | {fit_text} | {crop_text}")
+                f"{self.total_pages()} 页 | {fit_text} | {crop_text}{invert_text}")
 
     def _fit_label_to_pixmap(self, pixmap: QPixmap):
         """把页面标签的最小尺寸设为页面逻辑尺寸，让 QScrollArea 能滚动整页。
@@ -2516,6 +2573,7 @@ class MainWindow(QMainWindow):
         ("Ctrl+Shift+B",   "复制书签",      "复制当前PDF书签到剪贴板",       "copy_pdf_bookmarks"),
         ("F5",             "刷新文件",      "重新扫描PDF目录",               "refresh_files"),
         ("Ctrl+Shift+R",   "自动裁剪渲染",  "开关渲染前去白边/空白间距",     "toggle_auto_crop_mode"),
+        ("Ctrl+Shift+I",   "反色显示",      "白底黑字 ↔ 黑底白字（仅显示，不影响截取）", "toggle_invert_mode"),
         ("Ctrl+N",         "速记栏",        "显示/隐藏右侧速记栏（自动存 md）", "toggle_notes_panel"),
         ("Ctrl+/",         "快捷键列表",    "查看所有快捷键",                "show_shortcuts"),
     ]
@@ -2530,6 +2588,7 @@ class MainWindow(QMainWindow):
         ("显示/隐藏书签栏", "切换左侧书签面板",                 "toggle_bookmark_panel"),
         ("显示/隐藏速记栏", "切换右侧速记面板",                 "toggle_notes_panel"),
         ("插入位置标记",    "在速记里记下当前书名与页码",       "notes_insert_marker"),
+        ("反色显示",        "夜间看白底扫描件（只影响显示）",   "toggle_invert_mode"),
         ("使用帮助",        "查看使用说明",                     "show_help"),
     ]
 
@@ -2868,6 +2927,12 @@ class MainWindow(QMainWindow):
             self.notes_panel.setVisible(True)
         self.notes_panel.insert_location_marker()
         self.status.showMessage(f"已插入位置标记（速记自动保存到 {NOTES_PATH}）")
+
+    def toggle_invert_mode(self):
+        self.viewer.toggle_invert_enabled()
+        state = "开" if self.viewer.invert_enabled else "关"
+        # 这条消息要放在渲染之后：渲染会刷新状态栏，先说的话会被覆盖
+        self.status.showMessage(f"反色显示{state}（只改显示配色，截取输出仍是原样）")
 
 
 def main():

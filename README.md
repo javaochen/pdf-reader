@@ -21,6 +21,10 @@
 
 > 截图取自程序真实界面，样例书为原创排版内容。
 
+夜间反色显示（`Ctrl+Shift+I`）——同一页的黑底白字版本：
+
+![反色显示](docs/screenshots/05-invert.png)
+
 ## 核心特性
 
 - **循环无损截取**（`Ctrl+S`）：进入后一直保持，截完一次自动清空分割线可立即截下一张，
@@ -32,6 +36,8 @@
 - **自动去白边**（默认关闭，`Ctrl+Shift+R`）：含扫描墨点过滤与灰底自适应，显示与截取共用同一套坐标映射
 - **右侧速记栏**（`Ctrl+N`）：边看边写，停止输入即自动存到程序目录下的 `notes.md`；
   「插入位置」一键记下当前书名与页码，便于回溯原文
+- **反色显示**（`Ctrl+Shift+I`）：白底黑字 ↔ 黑底白字，夜间看扫描件不刺眼。
+  只改显示配色——**截取输出与去白边判定仍按原始像素**，发给 AI 的图永远是白底黑字
 - 书签目录导航、阅读进度自动恢复、书签导出 Markdown、命令面板、快速切换 PDF
 - 发布友好：不含任何机器路径，默认扫描**你自己**的「下载」文件夹，配置见下
 
@@ -64,6 +70,7 @@ copy reader_config.example.json reader_config.json     # Windows
 | `pdf_root_dir` | `PDF_READER_PDF_ROOT_DIR` | 系统「下载」文件夹 | 启动时扫描/打开的 PDF 目录 |
 | `state_dir` | `PDF_READER_STATE_DIR` | 同 `pdf_root_dir` | 阅读进度、最近打开记录的存放目录 |
 | `notes_file` | `PDF_READER_NOTES_FILE` | `notes.md`（程序目录） | 速记文件；相对路径按程序目录解析 |
+| `invert` | `PDF_READER_INVERT` | `false` | 启动即反色显示（夜间看扫描件） |
 | `initial_pdf_keyword` | `PDF_READER_INITIAL_PDF_KEYWORD` | 空 | 启动时按文件名关键字自动打开 |
 | `initial_page` | `PDF_READER_INITIAL_PAGE` | `1` | 无历史记录时的起始页 |
 
@@ -92,7 +99,7 @@ pdf_reader/
 ├─ notes.md                     # 速记（运行时自动创建，已 gitignore）
 ├─ assets/reader.ico            # 窗口图标
 ├─ docs/                        # 使用说明 / 设计文档 / 截图
-├─ tests/                       # 五套无头回归测试（124 项）
+├─ tests/                       # 六套无头回归测试（147 项）
 └─ tools/make_screenshots.py    # 重新生成 README 截图
 ```
 

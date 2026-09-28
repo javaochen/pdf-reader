@@ -258,6 +258,14 @@ app.processEvents()
 QTest.qWait(120)
 shoot(win, "04-zoom-formula.png", 1200)
 
+# 夜间反色：回到适合宽度并整体反色（只影响显示）
+win.viewer.set_invert_enabled(True)
+win.viewer.fit_width()
+to_top()
+app.processEvents()
+QTest.qWait(200)
+shoot(win, "05-invert.png", 1200)
+
 win.close()
 shutil.rmtree(TMP, ignore_errors=True)
 print("完成 →", OUT)
