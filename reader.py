@@ -1,8 +1,10 @@
 import bisect
+import hashlib
 import json
 import logging
 import math
 import os
+import sqlite3
 import sys
 import threading
 import time
@@ -13,7 +15,7 @@ from typing import Dict, List, Optional, Tuple, Any
 import fitz  # PyMuPDF
 import numpy as np
 from PySide6.QtCore import (
-    Qt, QRect, QPoint, QUrl, Signal, QEvent, QTimer, QThreadPool, QRunnable, Slot,
+    Qt, QRect, QPoint, QUrl, QObject, Signal, QEvent, QTimer, QThreadPool, QRunnable, QProcess, Slot,
 )
 from PySide6.QtGui import (
     QImage,
@@ -162,6 +164,29 @@ def resolve_notes_path(raw) -> Path:
 NOTES_PATH = resolve_notes_path(_cfg("notes_file", "notes.md"))
 NOTES_SAVE_DEBOUNCE_MS = 800          # 停止输入多久后落盘
 NOTES_MAX_BYTES = 2 * 1024 * 1024     # 加载上限：误指向超大文件时也不至于卡死界面
+
+
+def _cfg_int(key: str, default: int, lo: int, hi: int) -> int:
+    """整数配置，越界或写错时回退默认值并留日志（不静默改成奇怪的值）。"""
+    raw = _cfg(key, default)
+    try:
+        return max(lo, min(hi, int(raw)))
+    except (TypeError, ValueError):
+        log.warning("配置 %s=%r 不是整数，已回退为 %s", key, raw, default)
+        return default
+
+
+# ========== OCR 选字
+# 默认关闭：关掉时不起 OCR 子进程、不读缓存、不挂选字覆盖层（零开销）
+OCR_ENABLED_DEFAULT = False
+OCR_ENABLED = _cfg_bool("ocr_enabled", OCR_ENABLED_DEFAULT)
+OCR_ENGINE = str(_cfg("ocr_engine", "rapidocr"))        # rapidocr / windows / fake
+OCR_LONG_SIDE = _cfg_int("ocr_long_side", 1600, 600, 4000)   # 识别输入长边（实测 1600 够用）
+OCR_DEBOUNCE_MS = _cfg_int("ocr_debounce_ms", 400, 0, 5000)  # 翻页停稳多久才提交识别
+OCR_IDLE_KILL_S = _cfg_int("ocr_idle_kill_s", 120, 10, 3600)  # 空闲多久杀掉子进程（归还内存）
+OCR_CACHE_DIR = Path(str(_cfg("ocr_cache_dir", Path(STATE_DIR) / "ocr")))
+OCR_CACHE_KEEP = 60                   # 缓存最多保留多少本书的库（防止无限增长）
+OCR_WORKER = str(APP_DIR / "ocr_worker.py")
 
 # 图标优先用包内 assets/reader.ico（随包发布）；缺失时返回空串，使用 Qt 默认图标
 ICON_PATH = str(ASSETS_DIR / "reader.ico") if (ASSETS_DIR / "reader.ico").is_file() else ""
@@ -683,6 +708,12 @@ class HelpDialog(QDialog):
             "   - 只改显示配色：自动裁剪判定、无损截取输出都保持原始像素\n"
             "   - 想每次启动就反色：配置里写 \"invert\": true\n"
             "   - 遮挡模式下遮挡块会自动换成浅色，避免在黑底上看不见\n"
+            "12. OCR 选字（默认关闭）\n"
+            "   - Ctrl+Shift+O 开关；关闭后不起子进程、不写缓存、完全零开销\n"
+            "   - 开启后：当前页图片渲染完成 → 停稳约 0.4 秒 → 后台识别（不阻塞翻页）\n"
+            "   - 鼠标拖选文字，Ctrl+C 复制；双击选中一整行\n"
+            "   - 结果按页缓存到 state_dir/ocr/，重开同一页无需再识别\n"
+            "   - 引擎可配 ocr_engine：rapidocr（质量好，需安装）或 windows（系统自带，快）\n"
         )
         layout.addWidget(text)
         btn = QPushButton("关闭")
@@ -1115,6 +1146,582 @@ class NotesPanel(QWidget):
         return self._dirty
 
 
+class OcrStore:
+    """每本书一个 SQLite 库：页号 → 识别框 + 文字。坐标是**页面坐标(pt)**。
+
+    为什么要缓存：OCR 一页要 0.8~2 秒，翻回去再等一次毫无必要；检索也要靠它。
+    为什么用 SQLite：一本书上千页，键值对随手查、逐页原子写、不必加载全库。
+    库名由「绝对路径 + 文件大小 + 修改时间」哈希得到——换了文件自动换库，不会串。
+    """
+
+    SCHEMA = """
+    CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
+    CREATE TABLE IF NOT EXISTS pages (
+        page INTEGER PRIMARY KEY,
+        engine TEXT, long_side INTEGER,
+        pw REAL, ph REAL,
+        blocks TEXT, created TEXT
+    );
+    """
+
+    def __init__(self, cache_dir: Path, pdf_path: str):
+        self.cache_dir = Path(cache_dir)
+        self.pdf_path = pdf_path
+        self.key = self.make_key(pdf_path)
+        self.path = self.cache_dir / f"{self.key}.db"
+        self.conn: Optional[sqlite3.Connection] = None
+        self.disabled_reason = ""
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            self.conn = sqlite3.connect(str(self.path))
+            self.conn.executescript(self.SCHEMA)
+            self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('pdf', ?)", (pdf_path,))
+            self.conn.commit()
+        except Exception as e:
+            # 缓存不可用时不能拖垮阅读：退化成"每次现算"，并把原因留在日志里
+            log.warning("OCR 缓存不可用（%s）：%s", self.path, e)
+            self.disabled_reason = f"{type(e).__name__}: {e}"
+            self.conn = None
+
+    @staticmethod
+    def make_key(pdf_path: str) -> str:
+        try:
+            st = os.stat(pdf_path)
+            raw = f"{os.path.abspath(pdf_path)}|{st.st_size}|{int(st.st_mtime)}"
+        except OSError:
+            raw = os.path.abspath(pdf_path)
+        return hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()[:16]
+
+    # ---- 读写 ----
+    def load_page_set(self) -> set:
+        if self.conn is None:
+            return set()
+        try:
+            return {int(r[0]) for r in self.conn.execute("SELECT page FROM pages")}
+        except Exception:
+            log.warning("读取 OCR 已识别页列表失败", exc_info=True)
+            return set()
+
+    def get_page(self, page_index: int) -> Optional[dict]:
+        if self.conn is None:
+            return None
+        try:
+            row = self.conn.execute(
+                "SELECT engine, long_side, pw, ph, blocks FROM pages WHERE page=?",
+                (page_index,)).fetchone()
+        except Exception:
+            log.warning("读取 OCR 缓存失败 page=%s", page_index, exc_info=True)
+            return None
+        if not row:
+            return None
+        try:
+            return {"engine": row[0], "long_side": row[1], "pw": row[2], "ph": row[3],
+                    "blocks": json.loads(row[4])}
+        except Exception:
+            log.warning("OCR 缓存内容损坏 page=%s", page_index, exc_info=True)
+            return None
+
+    def put_page(self, page_index: int, pw: float, ph: float, engine: str,
+                 long_side: int, blocks: list) -> bool:
+        if self.conn is None:
+            return False
+        try:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO pages VALUES (?,?,?,?,?,?,?)",
+                (page_index, engine, long_side, pw, ph,
+                 json.dumps(blocks, ensure_ascii=False), time.strftime("%Y-%m-%d %H:%M:%S")))
+            self.conn.commit()
+            return True
+        except Exception:
+            log.warning("写入 OCR 缓存失败 page=%s", page_index, exc_info=True)
+            return False
+
+    def close(self):
+        if self.conn is not None:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            self.conn = None
+
+
+def prune_ocr_cache(cache_dir: Path, keep: int = OCR_CACHE_KEEP):
+    """只留最近用过的 keep 个库，避免读了很多书后缓存目录无限膨胀。"""
+    try:
+        files = sorted(Path(cache_dir).glob("*.db"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+        for old in files[keep:]:
+            old.unlink(missing_ok=True)
+    except Exception:
+        log.debug("清理 OCR 缓存失败", exc_info=True)
+
+
+class OcrClient(QObject):
+    """OCR 调度：防抖 → 单飞请求 → 结果落缓存；渲染路径上只做内存判断。
+
+    "不干扰快速翻页"靠三件事：
+      1. 渲染完成后只重启一个定时器（O(1)、不碰磁盘、不起进程）；
+      2. 连翻时定时器一直被推迟，所以**只有停下来那一页**会被真正提交识别；
+      3. 识别在独立子进程里跑，主进程从不等待它。
+    """
+
+    page_ready = Signal(int)          # 某页识别完成（int 为页序号，0-based）
+    failed = Signal(str)              # 失败原因（要能看见，不能静默）
+
+    def __init__(self, enabled: bool = OCR_ENABLED_DEFAULT, engine: str = OCR_ENGINE,
+                 long_side: int = OCR_LONG_SIDE, debounce_ms: int = OCR_DEBOUNCE_MS,
+                 idle_kill_s: int = OCR_IDLE_KILL_S, cache_dir: Path = OCR_CACHE_DIR,
+                 worker: str = OCR_WORKER, parent=None):
+        super().__init__(parent)
+        self.enabled = bool(enabled)
+        self.engine = engine
+        self.long_side = int(long_side)
+        self.idle_kill_s = int(idle_kill_s)
+        self.cache_dir = Path(cache_dir)
+        self.worker_path = worker
+        self.store: Optional[OcrStore] = None
+        self.process: Optional[QProcess] = None
+        self._blocks: Dict[int, list] = {}      # 内存里最近几页的框（覆盖层用）
+        self._done: set = set()                 # 已识别页（含磁盘缓存）
+        self._pending: set = set()              # 已提交、等结果
+        self._want: Optional[int] = None        # 当前最想识别的页
+        self._inflight: Optional[int] = None
+        self._last_used = 0.0
+        self._start_fail_count = 0
+        self._stderr_tail = ""
+        # 提交过的识别请求记录（诊断/测试用：能精确断言"某页只被提交过一次"）
+        self.requests: List[int] = []
+
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(max(0, int(debounce_ms)))
+        self._timer.timeout.connect(self._dispatch)
+
+        self._idle_timer = QTimer(self)
+        self._idle_timer.setInterval(5000)
+        self._idle_timer.timeout.connect(self._check_idle)
+
+    # ---- 书切换 ----
+    def set_book(self, pdf_path: Optional[str]):
+        self._blocks.clear()
+        self._pending.clear()
+        self._want = None
+        self._inflight = None
+        self._done = set()
+        if self.store is not None:
+            self.store.close()
+            self.store = None
+        if not pdf_path or not self.enabled:
+            return
+        self.store = OcrStore(self.cache_dir, pdf_path)
+        if self.store.disabled_reason:
+            self.failed.emit(f"OCR 缓存不可用：{self.store.disabled_reason}")
+        self._done = self.store.load_page_set()
+
+    # ---- 查询（覆盖层/状态栏用，纯内存） ----
+    def blocks(self, page_index: int) -> Optional[list]:
+        if page_index in self._blocks:
+            return self._blocks[page_index]
+        if self.store is not None and page_index in self._done:
+            got = self.store.get_page(page_index)
+            if got:
+                # 只把最近看过的页留在内存里，避免整本书的框堆在内存
+                if len(self._blocks) > 8:
+                    self._blocks.clear()
+                self._blocks[page_index] = got["blocks"]
+                return got["blocks"]
+        return None
+
+    def has_page(self, page_index: int) -> bool:
+        return page_index in self._done
+
+    def is_pending(self, page_index: int) -> bool:
+        return page_index in self._pending or self._inflight == page_index
+
+    # ---- 调度 ----
+    def schedule(self, page_index: int):
+        """页面渲染完成后调用。关掉 OCR 时这里是纯空转，一行 I/O 都没有。"""
+        if not self.enabled or self.store is None or page_index is None:
+            return
+        if page_index in self._done or page_index in self._pending:
+            return
+        self._want = page_index
+        self._timer.start()          # 连续翻页会不断推迟，只有停稳才提交
+
+    def request_now(self, page_index: int):
+        """不等防抖，立刻识别（用户主动点"识别本页"时用）。"""
+        if not self.enabled or self.store is None:
+            return
+        self._want = page_index
+        self._timer.stop()
+        self._dispatch()
+
+    def prefetch(self, page_index: int):
+        """往前预取一页的文字。
+
+        时机是"当前页识别完成、且你仍停在这一页"——所以它最多只领先一页，
+        不会演变成整本无人值守地跑；连续翻页时也不会插队（那时 _want 一直是新页）。
+        """
+        if not self.enabled or self.store is None or page_index is None:
+            return
+        if page_index in self._done or page_index in self._pending:
+            return
+        self._want = page_index
+        self._dispatch()
+
+    def _dispatch(self):
+        if not self.enabled or self.store is None or self._want is None:
+            return
+        if self._inflight is not None:
+            return                    # 单飞：等当前这页回来再说（_want 会保留最新值）
+        page = self._want
+        if page in self._done:
+            self._want = None
+            return
+        if not self._ensure_process():
+            return
+        pdf = self.store.pdf_path
+        req = {"cmd": "ocr", "pdf": pdf, "page": page, "engine": self.engine,
+               "long_side": self.long_side}
+        self._pending.add(page)
+        self._inflight = page
+        self._last_used = time.time()
+        self.requests.append(page)
+        del self.requests[:-64]
+        try:
+            self.process.write((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
+            self.process.waitForBytesWritten(1000)
+        except Exception as e:
+            self._pending.discard(page)
+            self._inflight = None
+            self.failed.emit(f"提交 OCR 请求失败：{e}")
+            return
+        if self._want == page:
+            self._want = None
+
+    # ---- 子进程 ----
+    def _ensure_process(self) -> bool:
+        if self.process is not None and self.process.state() == QProcess.Running:
+            return True
+        if self._start_fail_count >= 3:
+            return False
+        if not os.path.isfile(self.worker_path):
+            self.failed.emit(f"找不到 OCR 子进程脚本：{self.worker_path}")
+            self._start_fail_count = 3
+            return False
+        self._stderr_tail = ""
+        proc = QProcess(self)
+        proc.setProcessChannelMode(QProcess.SeparateChannels)
+        proc.readyReadStandardOutput.connect(self._on_stdout)
+        proc.readyReadStandardError.connect(self._on_stderr)
+        proc.finished.connect(self._on_finished)
+        # --idle：空闲一段时间后子进程自己退出，把模型内存还给系统
+        proc.start(sys.executable, [self.worker_path, "--idle", str(self.idle_kill_s)])
+        if not proc.waitForStarted(5000):
+            self._start_fail_count += 1
+            self.failed.emit("OCR 子进程启动失败")
+            return False
+        self.process = proc
+        if not self._idle_timer.isActive():
+            self._idle_timer.start()
+        return True
+
+    def _on_stdout(self):
+        if self.process is None:
+            return
+        raw = bytes(self.process.readAllStandardOutput()).decode("utf-8", "replace")
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except Exception:
+                log.debug("OCR 子进程输出非 JSON：%s", line[:200])
+                continue
+            self._handle_message(msg)
+
+    def _on_stderr(self):
+        if self.process is None:
+            return
+        txt = bytes(self.process.readAllStandardError()).decode("utf-8", "replace")
+        self._stderr_tail = (self._stderr_tail + txt)[-800:]
+        if txt.strip():
+            log.debug("OCR 子进程 stderr：%s", txt.strip()[:400])
+
+    def _handle_message(self, msg: dict):
+        page = msg.get("page")
+        if msg.get("pong"):
+            return
+        if msg.get("ok"):
+            blocks = msg.get("blocks") or []
+            if page is not None:
+                self._done.add(int(page))
+                self._blocks[int(page)] = blocks
+                if self.store is not None:
+                    self.store.put_page(int(page), msg.get("pw", 0.0), msg.get("ph", 0.0),
+                                        msg.get("engine", self.engine),
+                                        int(msg.get("long_side", self.long_side)), blocks)
+            if page is not None:
+                self._pending.discard(int(page))
+            self._inflight = None
+            if page is not None:
+                self.page_ready.emit(int(page))
+            return
+        # 失败：把原因说出来（引擎没装、文件读不了……）
+        err = msg.get("error") or msg.get("fatal") or "未知错误"
+        if page is not None:
+            self._pending.discard(int(page))
+        self._inflight = None
+        self.failed.emit(f"OCR 失败：{err}")
+
+    def _on_finished(self, code, status):
+        self._inflight = None
+        self._pending.clear()
+        if code not in (0, None) and self._start_fail_count < 3:
+            tail = self._stderr_tail.strip().splitlines()
+            hint = tail[-1] if tail else f"退出码 {code}"
+            self._start_fail_count += 1
+            self.failed.emit(f"OCR 子进程异常退出：{hint[:200]}")
+
+    def _check_idle(self):
+        if self.process is None or self.process.state() != QProcess.Running:
+            self._idle_timer.stop()
+            return
+        if self._inflight is not None:
+            return
+        if time.time() - self._last_used >= self.idle_kill_s:
+            log.debug("OCR 子进程空闲 %ss，主动退出以归还内存", self.idle_kill_s)
+            self.shutdown(kill_process=True)
+
+    def shutdown(self, kill_process: bool = False):
+        """窗口关闭/切换状态时调用：让子进程退出、关闭数据库。"""
+        self._timer.stop()
+        self._idle_timer.stop()
+        if self.process is not None:
+            try:
+                if self.process.state() == QProcess.Running:
+                    self.process.write(b'{"cmd":"quit"}\n')
+                    self.process.waitForBytesWritten(500)
+                    if not self.process.waitForFinished(1500):
+                        self.process.kill()
+                        self.process.waitForFinished(1000)
+            except Exception:
+                log.debug("关闭 OCR 子进程失败", exc_info=True)
+            self.process = None
+        if self.store is not None:
+            self.store.close()
+            self.store = None
+        self._pending.clear()
+        self._inflight = None
+        self._want = None
+
+
+class TextSelectOverlay(QWidget):
+    """页面图像之上的一层透明选字层：把 OCR 框映射到视口，鼠标拖选，Ctrl+C 复制。
+
+    只在"OCR 打开且本页有识别结果"时显示；关掉或没有结果时整个隐藏，
+    鼠标事件原样落到下面的阅读器（平移等行为完全不变）。
+    """
+
+    HL = QColor(80, 150, 255, 90)         # 选中高亮
+    HL_BORDER = QColor(60, 130, 240, 200)
+
+    def __init__(self, viewer, parent=None):
+        super().__init__(parent)
+        self.viewer = viewer
+        self.blocks: list = []            # [[x0,y0,x1,y1,text], ...] 页面坐标(pt)
+        self.anchor: Optional[int] = None
+        self.focus: Optional[int] = None
+        self._dragging = False
+        self.setMouseTracking(True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.hide()
+
+    # ---- 数据 ----
+    def set_blocks(self, blocks: Optional[list]):
+        self.blocks = list(blocks or [])
+        if self.anchor is not None and self.anchor >= len(self.blocks):
+            self.clear_selection()
+        self.sync_visibility()
+        self.update()
+
+    def clear_selection(self):
+        self.anchor = None
+        self.focus = None
+        self.update()
+
+    @property
+    def has_selection(self) -> bool:
+        return self.anchor is not None and self.focus is not None
+
+    def sync_visibility(self):
+        active = (self.viewer.ocr_enabled and bool(self.blocks)
+                  and not self.viewer.crop_mode
+                  and not self.viewer.crop_overlay.cover_mode)
+        self.setVisible(active)
+        if active:
+            self.raise_()
+
+    # ---- 坐标映射 ----
+    def _geometry(self):
+        """(页面坐标源矩形, 位图在视口中的位置与尺寸)，两者都取不到就 None。"""
+        info = self.viewer.display_pixmap_rect_in_viewport()
+        src = self.viewer.display_source_rect(self.viewer.current_page_index)
+        if info is None or src is None or src.width <= 0 or src.height <= 0:
+            return None
+        return src, info
+
+    def block_rects(self) -> List[QRect]:
+        """把所有 OCR 框换算到本覆盖层坐标系（仅在 _geometry 可用时）。"""
+        g = self._geometry()
+        if g is None:
+            return []
+        src, (gx, gy, gw, gh) = g
+        sx = gw / src.width
+        sy = gh / src.height
+        out = []
+        for b in self.blocks:
+            x0 = gx + (b[0] - src.x0) * sx
+            y0 = gy + (b[1] - src.y0) * sy
+            x1 = gx + (b[2] - src.x0) * sx
+            y1 = gy + (b[3] - src.y0) * sy
+            out.append(QRect(int(round(x0)), int(round(y0)),
+                             max(1, int(round(x1 - x0))), max(1, int(round(y1 - y0)))))
+        return out
+
+    def _hit(self, pos: QPoint) -> Optional[int]:
+        """命中最靠近的框；点在框外但在同一行高度也算（行间空隙不好点）。"""
+        rects = self.block_rects()
+        if not rects:
+            return None
+        for i, r in enumerate(rects):
+            if r.adjusted(-2, -3, 2, 3).contains(pos):
+                return i
+        # 退一步：同一水平带里最近的框
+        best, best_d = None, None
+        for i, r in enumerate(rects):
+            if r.top() - 6 <= pos.y() <= r.bottom() + 6:
+                d = min(abs(pos.x() - r.left()), abs(pos.x() - r.right()))
+                if best_d is None or d < best_d:
+                    best, best_d = i, d
+        return best
+
+    def selected_range(self) -> Optional[Tuple[int, int]]:
+        if not self.has_selection:
+            return None
+        a, b = int(self.anchor), int(self.focus)
+        return (min(a, b), max(a, b))
+
+    # ---- 鼠标 ----
+    def mousePressEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            event.ignore()
+            return
+        idx = self._hit(event.position().toPoint())
+        if idx is None:
+            self.clear_selection()
+            event.ignore()
+            return
+        if event.type() == QEvent.MouseButtonDblClick:
+            self.anchor = self.focus = idx
+            self._dragging = False
+        else:
+            self.anchor = self.focus = idx
+            self._dragging = True
+        self.update()
+        event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self._dragging:
+            idx = self._hit(event.position().toPoint())
+            if idx is not None and idx != self.focus:
+                self.focus = idx
+                self.update()
+            event.accept()
+            return
+        event.ignore()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._dragging:
+            self._dragging = False
+            event.accept()
+            return
+        event.ignore()
+
+    def mouseDoubleClickEvent(self, event):
+        self.mousePressEvent(event)
+
+    # ---- 绘制 ----
+    def paintEvent(self, event):
+        if not self.blocks:
+            return
+        rects = self.block_rects()
+        rng = self.selected_range()
+        if not rects or rng is None:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(QPen(self.HL_BORDER, 1))
+        painter.setBrush(self.HL)
+        for i in range(rng[0], min(rng[1], len(rects) - 1) + 1):
+            painter.drawRect(rects[i].adjusted(-1, -1, 1, 1))
+
+    # ---- 复制 ----
+    def selected_text(self) -> str:
+        rng = self.selected_range()
+        if rng is None:
+            return ""
+        return join_blocks([self.blocks[i] for i in range(rng[0], min(rng[1], len(self.blocks) - 1) + 1)])
+
+    def select_all(self):
+        if self.blocks:
+            self.anchor = 0
+            self.focus = len(self.blocks) - 1
+            self.update()
+
+
+def join_blocks(blocks: list) -> str:
+    """把若干个框的文字拼成可粘贴的文本。
+
+    同一行内的框直接相连（中文没有词间空格）；换了行才断行。
+    行内如果是拉丁文，则补一个空格（否则 "second"+"line" 会粘成 "secondline"）。
+    """
+    if not blocks:
+        return ""
+    lines: List[str] = []
+    cur = ""
+    cur_y: Optional[float] = None
+    for b in blocks:
+        text = str(b[4])
+        if not text:
+            continue
+        y_mid = (b[1] + b[3]) / 2.0
+        h = max(1.0, b[3] - b[1])
+        if cur_y is None or abs(y_mid - cur_y) <= h * 0.6:
+            if cur:
+                if _needs_space(cur[-1], text[0]):
+                    cur += " "
+                cur += text
+            else:
+                cur = text
+            cur_y = y_mid if cur_y is None else (cur_y + y_mid) / 2.0
+        else:
+            lines.append(cur)
+            cur = text
+            cur_y = y_mid
+    if cur:
+        lines.append(cur)
+    return "\n".join(lines)
+
+
+def _needs_space(left: str, right: str) -> bool:
+    """两个拉丁/数字字符相邻时补空格；只要有一侧是中文就不补。"""
+    def latin(ch):
+        return ch.isascii() and (ch.isalnum())
+    return latin(left) and latin(right)
+
+
 class CropOverlay(QWidget):
     crop_ready = Signal()
 
@@ -1179,20 +1786,15 @@ class CropOverlay(QWidget):
         标签的父级是滚动区视口、覆盖层也是视口的子控件，二者是兄弟关系。
         Qt 在这种情况下会打印 "QWidget::mapTo(): parent must be in parent hierarchy"
         并返回错误坐标（实测 441 而非 236），于是分割线画偏、滚动后记录的位置也错。
-        改成先映射到共同祖先（视口）再做差。
+        改成先映射到共同祖先（视口）再做差。基准算法现在放在 viewer 里，
+        与选字层共用一份（避免两处各算一遍、迟早不一致）。
         """
-        label = self.viewer.image_label
-        pixmap = label.pixmap()
-        if pixmap is None or pixmap.isNull():
+        info = self.viewer.display_pixmap_rect_in_viewport()
+        if info is None:
             return None
-        pm_dpr = pixmap.devicePixelRatio() or 1.0
-        pm_w = pixmap.width() / pm_dpr
-        pm_h = pixmap.height() / pm_dpr
-        viewport = self.viewer.scroll.viewport()
-        origin = label.mapTo(viewport, QPoint(0, 0)) - self.mapTo(viewport, QPoint(0, 0))
-        x0 = origin.x() + (label.width() - pm_w) / 2.0
-        y0 = origin.y() + (label.height() - pm_h) / 2.0
-        return x0, y0, pm_w, pm_h
+        x0, y0, pm_w, pm_h = info
+        vp_origin = self.mapTo(self.viewer.scroll.viewport(), QPoint(0, 0))
+        return x0 - vp_origin.x(), y0 - vp_origin.y(), pm_w, pm_h
 
     def _map_to_page_y(self, pos):
         # 水平截取线只关心鼠标的纵向位置落在页面范围内。
@@ -1419,6 +2021,10 @@ class PdfViewer(QWidget):
         self._toc_cache: Optional[list] = None
         self.render_id = 0
         self.crop_mode = False
+        # OCR 选字（默认关；关掉时不起子进程、不读缓存、覆盖层整层隐藏）
+        self.ocr_enabled = OCR_ENABLED
+        self.ocr_state_text = ""          # 状态栏里的 OCR 状态（由主窗口维护）
+        self.render_done_callback = None
         # 视图模式：fit_page（整页）/ fit_width（适合宽度）/ manual（用户缩放）
         self.view_mode = VIEW_FIT_PAGE
 
@@ -1467,6 +2073,7 @@ class PdfViewer(QWidget):
 
         self.crop_overlay = CropOverlay(self, self.scroll.viewport())
         self.crop_overlay.crop_ready.connect(self.copy_crop_to_clipboard)
+        self.text_overlay = TextSelectOverlay(self, self.scroll.viewport())
         self.scroll.viewport().installEventFilter(self)
         self.scroll.viewport().setMouseTracking(True)
 
@@ -1524,6 +2131,7 @@ class PdfViewer(QWidget):
             et = event.type()
             if et in (QEvent.Resize, QEvent.Show):
                 self._sync_crop_overlay()
+                self.sync_text_overlay()
                 if self.view_mode in (VIEW_FIT_PAGE, VIEW_FIT_WIDTH) and self.doc:
                     # 窗口拖拽会连续触发 Resize：防抖，否则每像素都整页重渲染
                     self._schedule_render(0 if et == QEvent.Show else RENDER_DEBOUNCE_MS)
@@ -1546,8 +2154,12 @@ class PdfViewer(QWidget):
                 self.scroll.viewport().unsetCursor()
                 return True
             elif et == QEvent.MouseButtonDblClick and event.button() == Qt.LeftButton:
-                self._zoom_toggle_at(event.position().toPoint())
+                # 有可选中文字时，双击是"选一整行"（覆盖层自己处理），不做缩放切换
+                if not (self.text_overlay.isVisible() and self.text_overlay.blocks):
+                    self._zoom_toggle_at(event.position().toPoint())
                 return True
+            elif et == QEvent.Wheel:
+                self.sync_text_overlay()
         return super().eventFilter(obj, event)
 
     def _can_drag_pan(self) -> bool:
@@ -2162,8 +2774,62 @@ class PdfViewer(QWidget):
         else:
             crop_text = "自动裁剪开"
         invert_text = " | 反色" if self.invert_enabled else ""
-        return (f"{os.path.basename(self.current_path)} | 第 {self.current_page_1_based()} / "
-                f"{self.total_pages()} 页 | {fit_text} | {crop_text}{invert_text}")
+        parts = [f"{os.path.basename(self.current_path)} | 第 {self.current_page_1_based()} / "
+                 f"{self.total_pages()} 页 | {fit_text} | {crop_text}"]
+        if self.ocr_state_text:
+            parts.append(self.ocr_state_text)
+        if invert_text:
+            parts.append("反色")
+        return " | ".join(parts)
+
+    def display_pixmap_rect_in_viewport(self):
+        """页面位图在滚动区视口坐标系里的位置与逻辑尺寸（覆盖层共用的坐标基准）。
+
+        CropOverlay 与选字层都要用它把"页面坐标"换成屏幕坐标，逻辑只留这一份。
+        """
+        label = self.image_label
+        pixmap = label.pixmap()
+        if pixmap is None or pixmap.isNull():
+            return None
+        dpr = pixmap.devicePixelRatio() or 1.0
+        pm_w, pm_h = pixmap.width() / dpr, pixmap.height() / dpr
+        viewport = self.scroll.viewport()
+        origin = label.mapTo(viewport, QPoint(0, 0))
+        return (origin.x() + (label.width() - pm_w) / 2.0,
+                origin.y() + (label.height() - pm_h) / 2.0,
+                pm_w, pm_h)
+
+    def display_source_rect(self, page_index: int) -> Optional[fitz.Rect]:
+        """当前显示位图对应页面的哪一块（去白边时是内容框，否则整页）。"""
+        if not self.doc:
+            return None
+        try:
+            box = self._content_box_pt(page_index)
+            if box is not None:
+                return fitz.Rect(box)
+            return fitz.Rect(self.doc.load_page(page_index).rect)
+        except Exception:
+            log.debug("取显示源矩形失败 page=%s", page_index, exc_info=True)
+            return None
+
+    # ---- 选字（OCR 文字层） ----
+    def set_ocr_enabled(self, enabled: bool):
+        self.ocr_enabled = bool(enabled)
+        self.sync_text_overlay()
+
+    def sync_text_overlay(self):
+        overlay = getattr(self, "text_overlay", None)
+        if overlay is None:
+            return
+        overlay.sync_visibility()
+        overlay.update()
+
+    def copy_ocr_selection(self) -> str:
+        """把选中的 OCR 文字放进剪贴板，返回复制的文本（供状态栏提示）。"""
+        text = self.text_overlay.selected_text()
+        if text:
+            QGuiApplication.clipboard().setText(text)
+        return text
 
     def _fit_label_to_pixmap(self, pixmap: QPixmap):
         """把页面标签的最小尺寸设为页面逻辑尺寸，让 QScrollArea 能滚动整页。
@@ -2198,9 +2864,16 @@ class PdfViewer(QWidget):
             self.image_label.setPixmap(pixmap)
             self._fit_label_to_pixmap(pixmap)
             self._sync_crop_overlay()
+            self.sync_text_overlay()
             self.update_status()
             # 当前页显示完就把相邻页丢到后台渲染，下一页翻页即命中缓存
             self._schedule_prefetch()
+            # OCR 选字：只在渲染完成之后通知一声（回调里只重启一个定时器，不阻塞）
+            if self.render_done_callback is not None:
+                try:
+                    self.render_done_callback(self.current_page_index)
+                except Exception:
+                    log.debug("渲染完成回调失败", exc_info=True)
         except Exception as e:
             log.error("渲染当前页失败 page=%s", self.current_page_index, exc_info=True)
             self.image_label.setText(f"渲染失败：{e}")
@@ -2497,6 +3170,16 @@ class MainWindow(QMainWindow):
         self.bookmark_panel = BookmarkPanel(self.jump_to_page, self._nav_bookmark)
         self.notes_panel = NotesPanel(NOTES_PATH, context_provider=self.notes_context)
 
+        # OCR 选字：调度器 + 子进程；关掉时它只是一组空条件判断
+        self.ocr = OcrClient(enabled=OCR_ENABLED, engine=OCR_ENGINE, long_side=OCR_LONG_SIDE,
+                             debounce_ms=OCR_DEBOUNCE_MS, idle_kill_s=OCR_IDLE_KILL_S,
+                             cache_dir=OCR_CACHE_DIR, parent=self)
+        self.ocr.page_ready.connect(self.on_ocr_page_ready)
+        self.ocr.failed.connect(self.on_ocr_failed)
+        self.viewer.set_ocr_enabled(self.ocr.enabled)
+        self.viewer.render_done_callback = self.on_page_rendered
+        prune_ocr_cache(OCR_CACHE_DIR, OCR_CACHE_KEEP)
+
         self.splitter = QSplitter()
         self.splitter.addWidget(self.bookmark_panel)
         self.splitter.addWidget(self.viewer)
@@ -2574,6 +3257,8 @@ class MainWindow(QMainWindow):
         ("F5",             "刷新文件",      "重新扫描PDF目录",               "refresh_files"),
         ("Ctrl+Shift+R",   "自动裁剪渲染",  "开关渲染前去白边/空白间距",     "toggle_auto_crop_mode"),
         ("Ctrl+Shift+I",   "反色显示",      "白底黑字 ↔ 黑底白字（仅显示，不影响截取）", "toggle_invert_mode"),
+        ("Ctrl+Shift+O",   "OCR 选字",      "开关选字模式（识别后的文字可拖选复制）", "toggle_ocr_mode"),
+        ("Ctrl+C",         "复制选中文字",  "把选中的 OCR 文字复制到剪贴板", "copy_ocr_selection_cmd"),
         ("Ctrl+N",         "速记栏",        "显示/隐藏右侧速记栏（自动存 md）", "toggle_notes_panel"),
         ("Ctrl+/",         "快捷键列表",    "查看所有快捷键",                "show_shortcuts"),
     ]
@@ -2589,6 +3274,9 @@ class MainWindow(QMainWindow):
         ("显示/隐藏速记栏", "切换右侧速记面板",                 "toggle_notes_panel"),
         ("插入位置标记",    "在速记里记下当前书名与页码",       "notes_insert_marker"),
         ("反色显示",        "夜间看白底扫描件（只影响显示）",   "toggle_invert_mode"),
+        ("OCR 选字开关",    "识别当前页文字，之后可拖选复制",   "toggle_ocr_mode"),
+        ("识别本页文字",    "立即识别当前页（不等防抖）",       "ocr_page_now"),
+        ("复制选中文字",    "把选中的 OCR 文字复制到剪贴板",     "copy_ocr_selection_cmd"),
         ("使用帮助",        "查看使用说明",                     "show_help"),
     ]
 
@@ -2838,6 +3526,12 @@ class MainWindow(QMainWindow):
         # 没有历史记录时用配置的初始页（此前 INITIAL_PAGE 定义了却从未被读取）
         page = self.history.get_last_page(abs_path, INITIAL_PAGE) if explicit_page is None else explicit_page
 
+        # 先把 OCR 缓存库切到这本书：首屏渲染会立刻触发 on_page_rendered，
+        # 那时 store 必须已经就位，否则第一页的调度与选字层会被漏掉
+        # （关掉 OCR 时这行是空操作）
+        self.ocr.set_book(abs_path if self.ocr.enabled else None)
+        self.viewer.text_overlay.set_blocks(None)
+
         if not self.viewer.open_pdf(abs_path, page):
             # 打开失败：不记历史，也不让打不开的文件污染"最近打开"
             return
@@ -2861,6 +3555,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self._flush_state()
         self.notes_panel.flush()      # 速记未落盘的改动（防抖未触发）在关窗前补齐
+        self.ocr.shutdown()           # 杀掉 OCR 子进程、关闭缓存库
         super().closeEvent(event)
 
     def on_page_changed(self, path: str, page_1_based: int):
@@ -2933,6 +3628,91 @@ class MainWindow(QMainWindow):
         state = "开" if self.viewer.invert_enabled else "关"
         # 这条消息要放在渲染之后：渲染会刷新状态栏，先说的话会被覆盖
         self.status.showMessage(f"反色显示{state}（只改显示配色，截取输出仍是原样）")
+
+    # ---- OCR 选字 ----
+    def update_ocr_state_text(self, page_index: Optional[int] = None):
+        """状态栏里的 OCR 状态文字（关闭时为空，等于不显示）。"""
+        if not self.ocr.enabled:
+            self.viewer.ocr_state_text = ""
+            return
+        if page_index is None:
+            page_index = self.viewer.current_page_index
+        if self.ocr.blocks(page_index) is not None:
+            self.viewer.ocr_state_text = "OCR 可选中"
+        elif self.ocr.is_pending(page_index):
+            self.viewer.ocr_state_text = "OCR 识别中…"
+        else:
+            self.viewer.ocr_state_text = "OCR 待识别"
+
+    def on_page_rendered(self, page_index: int):
+        """页面图像渲染完成后调用：提交一次（防抖的）OCR 请求，并刷新选字层。
+
+        这里必须保持 O(1)：连翻页时它会被高频调用，任何磁盘或进程操作都会拖慢翻页。
+        """
+        if not self.ocr.enabled:
+            return
+        blocks = self.ocr.blocks(page_index)
+        self.viewer.text_overlay.set_blocks(blocks)
+        if blocks is None:
+            self.ocr.schedule(page_index)
+        self.update_ocr_state_text(page_index)
+        self.viewer.update_status()
+
+    def on_ocr_page_ready(self, page_index: int):
+        if page_index == self.viewer.current_page_index:
+            self.viewer.text_overlay.set_blocks(self.ocr.blocks(page_index))
+        self.update_ocr_state_text()
+        self.viewer.update_status()
+        n = len(self.ocr.blocks(page_index) or [])
+        if page_index == self.viewer.current_page_index:
+            self.status.showMessage(f"本页文字已可选中（{n} 个文字块）；拖选后 Ctrl+C 复制")
+            # 你还停在这一页 → 顺手把下一页也识别了，翻过去就能直接选字
+            nxt = page_index + 1
+            if nxt < self.viewer.total_pages():
+                self.ocr.prefetch(nxt)
+
+    def on_ocr_failed(self, message: str):
+        log.warning("OCR 失败：%s", message)
+        self.status.showMessage(message)
+
+    def toggle_ocr_mode(self):
+        self.ocr.enabled = not self.ocr.enabled
+        self.viewer.set_ocr_enabled(self.ocr.enabled)
+        if self.ocr.enabled:
+            if self.viewer.current_path:
+                self.ocr.set_book(self.viewer.current_path)
+            self.on_page_rendered(self.viewer.current_page_index)
+            self.ocr.schedule(self.viewer.current_page_index)
+            self.status.showMessage(
+                f"OCR 选字已开启（引擎 {self.ocr.engine}）；识别在当前页稳定后后台进行，"
+                f"完成后拖选文字、Ctrl+C 复制")
+        else:
+            # 彻底关闭：子进程杀掉、数据库关闭、覆盖层隐藏，恢复零开销
+            self.ocr.shutdown()
+            self.viewer.text_overlay.set_blocks(None)
+            self.viewer.sync_text_overlay()
+            self.update_ocr_state_text()
+            self.status.showMessage("OCR 选字已关闭（不再起子进程、不再写缓存）")
+        self.viewer.update_status()
+
+    def ocr_page_now(self):
+        if not self.ocr.enabled:
+            self.status.showMessage("OCR 选字未开启：Ctrl+Shift+O 打开")
+            return
+        if not self.viewer.current_path:
+            return
+        if self.ocr.blocks(self.viewer.current_page_index) is not None:
+            self.status.showMessage("本页已有识别结果，可直接拖选")
+            return
+        self.ocr.request_now(self.viewer.current_page_index)
+        self.status.showMessage("正在识别本页文字…")
+
+    def copy_ocr_selection_cmd(self):
+        text = self.viewer.copy_ocr_selection()
+        if text:
+            self.status.showMessage(f"已复制选中的 {len(text)} 个字符")
+        else:
+            self.status.showMessage("没有选中文字（先开启 OCR 选字，再在页面上拖选）")
 
 
 def main():

@@ -31,13 +31,14 @@
 
 ## 代码结构
 
-单文件 `reader.py`（约 2600 行），按职责自上而下分块：
+单文件 `reader.py`（约 3600 行）+ 独立子进程 `ocr_worker.py`，按职责自上而下分块：
 
 | 区块 | 内容 |
 |---|---|
-| 配置层 | `load_config` / `_cfg` / `default_downloads_dir`：配置优先级与默认目录解析（无机器路径） |
-| 图像算法 | `rgb_to_gray`、`content_row_col_hits`、`find_content_bbox_arr`、`estimate_background_level`、`adaptive_white_threshold`、`qimage_to_rgb_array`、`safe_crop_box` |
-| 持久化 | `HistoryStore`（最后页码）、`RecentStore`（最近打开）：脏标记 + 防抖落盘 + 损坏文件可见报错 |
+| 配置层 | `load_config` / `_cfg` / `_cfg_bool` / `_cfg_int` / `default_downloads_dir` / `resolve_notes_path`：配置优先级与默认路径解析（无机器路径） |
+| 图像算法 | `rgb_to_gray`、`content_row_col_hits`、`find_content_bbox_arr`、`estimate_background_level`、`adaptive_white_threshold`、`qimage_to_rgb_array`、`invert_qimage`、`safe_crop_box` |
+| 持久化 | `HistoryStore`（最后页码）、`RecentStore`（最近打开）、`OcrStore`（每本书一个 SQLite：页 → 文字框） |
+| OCR | `ocr_worker.py`（子进程：RapidOCR / Windows / fake 三引擎 + 中英混排后处理）、`OcrClient`（防抖调度、单飞请求、缓存、空闲回收）、`TextSelectOverlay`（选字层）、`join_blocks`（拼接规则） |
 | 对话框 | `ShortcutListDialog`、`HelpDialog`、`BookmarkCopyDialog`、`QuickSwitchDialog`、`JumpPageDialog`、`CommandDialog` |
 | 界面部件 | `BookmarkPanel`、`NotesPanel`（右侧速记，自动落盘）、`CropOverlay`（截取/遮挡覆盖层）、`PdfViewer`（渲染 + 缓存 + 截取）、`MainWindow`（快捷键/命令注册、状态落盘） |
 | 后台任务 | `_PrefetchTask`（QRunnable，只产出 QImage，QPixmap 回主线程） |
@@ -48,6 +49,8 @@
   显示、fit 缩放、无损截取共用；标记状态则只有 `CropOverlay` 一份（viewer 侧是 property 代理）。
 - **每页可以按需算内容框**，不依赖"该页被显示过"。
 - **后台预取的缓存键必须按目标页自己的缩放算**，否则键对不上、预取白做。
+- **屏幕坐标换算只有一份**：`PdfViewer.display_pixmap_rect_in_viewport()` + `display_source_rect()`，
+  截取覆盖层与选字层都走它（曾经两处各算一遍，迟早不一致）。
 
 ## 实现要点
 
@@ -61,12 +64,37 @@
 | 后台预取 | 显示完当前页就把前后各一页交给 worker 线程渲染（QImage 可跨线程，QPixmap 回主线程；MuPDF 访问用锁串行化） |
 | 视图模式 | 适合页面 / 适合宽度 / 手动；页面大于视口时把标签最小尺寸抬到页面尺寸，滚动条范围才正确（见"已知限制"） |
 | 反色显示 | 在显示路径的**缩放下采样之后**做 `QImage.invertPixels(InvertRgb)`（处理像素最少；反色与缩放可交换，结果一致）。反色标记进页面缓存键与预取键，否则切换配色会命中另一种配色的旧缓存；`exact=True`（无损截取）路径永不反色，内容框探测也走原始像素 |
+| OCR 调度 | 页面渲染完成后只重启一个定时器（`ocr_debounce_ms`，O(1)、不碰磁盘、不起进程）→ 连翻页时一直被推迟，**只有停稳那一页**被提交；提交是单飞（同时只跑一页），结果回主线程落 SQLite 并放进内存字典；当前页完成后**预取下一页**（最多领先一页，不会变成无人值守跑整本） |
+| OCR 进程隔离 | 识别跑在子进程（`ocr_worker.py`），模型内存（实测常驻 140MB / 峰值 ~380MB）不在阅读器里；空闲 `ocr_idle_kill_s` 由**看门狗线程**退出（主循环阻塞在 stdin 上，靠循环里的判断根本执行不到），stdin 断开也会立刻退出，避免留下孤儿进程占内存；子进程降到低于正常优先级，尽量不跟界面抢 CPU |
+| 文字坐标 | 识别结果一律换算成**页面坐标(pt)** 再存储与传递，因此与显示缩放、去白边、反色都无关；选字层用 `display_pixmap_rect_in_viewport()` + `display_source_rect()` 把页面坐标映射成屏幕矩形 |
+| 缓存库 | 每本书一个 SQLite，文件名 = f(绝对路径, 大小, 修改时间) 的哈希——换文件自动换库不串味；读写失败只降级（当次现算）不让阅读崩掉；目录最多留 60 个库 |
 | 页面缓存 | 条目数 + 总字节数双重上限（默认 256 MB），截取产生的高分辨率位图不进缓存 |
 | 防抖 | 滚轮缩放、窗口尺寸变化合并为一次渲染；阅读进度落盘合并为一次写入 |
 | 速记落盘 | 停止输入 800 ms 后写盘（`NOTES_SAVE_DEBOUNCE_MS`），关窗 `flush()` 兜底；写盘走"临时文件 + `os.replace`"原子替换，崩溃不会把笔记截成半截；载入限 2 MB、写失败在面板状态行标红而不是静默 |
 | 上限保护 | 单次跨页截取最多 50 页、输出最多 2 亿像素，超限直接提示而不是拼出 GB 级位图 |
 
 ## 实测数据
+
+### OCR 引擎选型（同一页：谢惠民 p.100，输入长边 1600px）
+
+| 引擎 / 配置 | 单页耗时 | 常驻内存 | 中文质量 | 框粒度 |
+|---|---|---|---|---|
+| Windows 自带 OCR（系统 zh-cn） | **0.78 s** | **~135 MB** | 字间插空格、数字标点常错（`5 ． 2 ， 2`） | 词级（721 框/页） |
+| RapidOCR 自带默认 | 4.83 s | ~360 MB | 好 | 行级（35 框/页） |
+| RapidOCR + 8 线程 | **2.30 s** | **~140 MB** | 好 | 行级 |
+| RapidOCR + 8 线程 + ORT 内存池 | 2.30 s | 639 MB（峰值 1021 MB） | 好 | 行级 |
+| 识别模型单独跑（隔离测量） | 35 行 ≈ 285 ms | — | — | — |
+
+结论与踩坑：
+
+- **只设线程、不开内存池**：内存池对稳态速度毫无收益却多吃 500MB。
+  （这里曾经把"开内存池"和"设线程"两处改动放在一起测，得到"内存池能提速"的错误结论，
+  隔离重测后才更正——`_patch_rapidocr_threads` 的注释里记着这件事。）
+- **输入不是越大越好**：2800px 比 1600px 慢 40% 且质量没有提升。
+- **模型本身只要 285ms/35 行**，RapidOCR 剩下的差距是它没把行批起来（上游实现问题）。
+- Windows OCR 快且轻，但中文要后处理才能用，数字标点仍会错，所以只作为可选快档。
+- 质量对照（同一段）：`例题5.2.2，例题5.4.1和命题10.1.5`（RapidOCR 正确）
+  vs `例 题 5 ． 2 ， 2 …`（Windows OCR）；英文标题 `COMPLEX ANALYSIS` 亦然。
 
 同一台机器，改动前后**同文档、同页、同条带**对比。
 
@@ -98,8 +126,8 @@
 
 ## 测试
 
-六套无头回归测试，**不需要显示器**（自动用 Qt `offscreen` 平台），共 147 项。
-测试会把 PDF 目录、状态目录与速记文件都指向包内临时目录，不会扫描或写入用户的真实下载目录与真实速记。
+七套无头回归测试，**不需要显示器**（自动用 Qt `offscreen` 平台），共 193 项。
+测试会把 PDF 目录、状态目录、速记文件与 OCR 缓存都指向包内临时目录，不会扫描或写入用户的真实数据。
 
 ```bash
 python tests/test_crop_loop.py         # 截取模式循环 + 跳页后仍可用（34 项）
@@ -107,8 +135,12 @@ python tests/test_capture_autocrop.py  # 截取/自动裁剪/缓存/防抖/上�
 python tests/test_math_reading.py      # 原生分辨率/抗噪阈值/预取/视图模式（24 项）
 python tests/test_invert.py            # 反色只影响显示、不污染截取（23 项）
 python tests/test_notes.py             # 速记自动落盘/防抖/位置标记/失败不静默（25 项）
+python tests/test_ocr.py               # OCR 协议/缓存/防抖/坐标/拖选复制/关闭零开销（46 项）
 python tests/test_nav.py               # 书签相对导航（12 例）
 ```
+
+OCR 那套用 `fake` 引擎跑完整链路（协议、缓存、坐标、拖选、复制），**秒级且不加载模型**；
+真实引擎的表现由 `docs/DESIGN.md` 的实测表与手工冒烟负责（模型 380MB 不该进测试套件）。
 
 一条环境限制：Qt 只在**窗口处于激活状态**时派发 `WindowShortcut` 快捷键，而离屏平台 +
 `WA_DontShowOnScreen` 的窗口永远不是 active（实测 `isActiveWindow()` 恒为 False，
@@ -132,6 +164,10 @@ python tests/test_nav.py               # 书签相对导航（12 例）
 - 反色：显示路径确实换色（白纸↔黑块互换）、关掉后逐像素恢复原样（缓存键含反色）、
   **无损截取与精确渲染路径永远是原始白底黑字**、内容框探测仍按原始像素工作、
   预取结果与当前配色一致且键里带反色标记、状态栏标出反色
+- OCR：子进程协议（ping/识别/未知引擎报错/quit/空闲自杀/父进程断开即退出）、缓存读写与按文件隔离、
+  **连翻页时只有停稳那页被提交**、**回到已识别页不重复提交**（按请求记录精确断言）、
+  框能换算成屏幕矩形、拖选/双击选行、`Ctrl+C` 复制与剪贴板一致、
+  **关闭后不起进程/不调度/不请求**、速记栏的 `Ctrl+C` 不被抢
 
 ## 打包发布
 
@@ -167,6 +203,10 @@ python tools/make_screenshots.py        # 输出到 docs/screenshots/
   先用起来看是否真的在用，再决定要不要多文件（按书/按章）与公式渲染
 - 反色是**纯反色**（`255−x`），没有做"降白 / 护眼暖色 / 可调对比度"这类更温和的夜间方案：
   灰底扫描件反色后对比度会偏高，若需要可以再加一档"只压白、不翻黑"的降白模式
+- OCR **给不了公式**（积分号、上下标、矩阵会乱），它的价值是中文段落可复制与将来的全文检索
+- OCR 只做"当前页 + 下一页预取"，**没有整本后台识别**（1780 页 × 2.3s ≈ 1 小时，需要可暂停/续传
+  的任务队列与进度条，属于下一步）
+- `windows` 引擎的中文需要后处理、数字标点仍会错，且只在 Windows 可用
 - 连续滚动（长图模式）、双页对开、笔记导出到现在都没有，只有页码级进度
 
 ## 本地集成

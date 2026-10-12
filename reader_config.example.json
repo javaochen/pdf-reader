@@ -5,5 +5,11 @@
   "initial_pdf_keyword": "",
   "initial_page": 1,
   "notes_file": "notes.md",
-  "invert": false
+  "invert": false,
+  "ocr_enabled": false,
+  "ocr_engine": "rapidocr",
+  "ocr_long_side": 1600,
+  "ocr_debounce_ms": 400,
+  "ocr_idle_kill_s": 120,
+  "ocr_cache_dir": null
 }
