@@ -26,6 +26,19 @@ import sys
 import threading
 import time
 
+# stdio 必须钉死 UTF-8：主进程发来的是 UTF-8 字节，而 Windows 上子进程默认按系统
+# 代码页(中文系统是 cp936)解码 stdin —— 中文路径会被解成乱码，于是"文件名太长/找不到
+# 文件"，某些字节组合还会把 JSON 里的 \\ 吃掉，报成 "Invalid \escape"。
+# （这两个症状是同一个根因；开发时因为 shell 里设了 PYTHONIOENCODING=utf-8，子进程
+#   继承了它，所以一直没暴露。）
+for _stream, _kw in ((sys.stdin, {"errors": "replace"}),
+                     (sys.stdout, {"newline": "\n"}),
+                     (sys.stderr, {"errors": "replace"})):
+    try:
+        _stream.reconfigure(encoding="utf-8", **_kw)
+    except Exception:
+        pass
+
 # 把线程数压到物理核的一半左右：实测 8 线程最优（16 线程反而更慢，48ms→123ms/批）
 DEFAULT_THREADS = 8
 

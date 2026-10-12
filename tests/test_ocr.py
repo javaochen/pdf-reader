@@ -18,6 +18,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PKG = os.path.dirname(HERE)
 sys.path.insert(0, PKG)
 
+# 故意清掉 PYTHONIOENCODING：真实启动（run.bat / launcher）没有这个变量，而它一旦存在
+# 就会掩盖"子进程 stdio 按 cp936 解码"的整类问题（中文路径变乱码 → 找不到文件）。
+os.environ.pop("PYTHONIOENCODING", None)
+NO_IOENC = {k: v for k, v in os.environ.items() if k != "PYTHONIOENCODING"}
+
 TMP = os.path.join(PKG, "_test_tmp_ocr")
 shutil.rmtree(TMP, ignore_errors=True)
 os.makedirs(TMP, exist_ok=True)
@@ -60,8 +65,9 @@ def wait_for(predicate, timeout_ms=8000, step=100):
     return bool(predicate())
 
 
-# 造一本 4 页小书：有内容区域（用于验证坐标映射在有/无去白边时都对）
-pdf = os.path.join(TMP, "t.pdf")
+# 造一本 4 页小书：**文件名故意用中文 + 全角括号**——这正是当初让"子进程 stdio 编码"
+# 问题暴露的场景（全 ASCII 路径的测试抓不到它）
+pdf = os.path.join(TMP, "测试（中文）书.pdf")
 doc = fitz.open()
 for i in range(4):
     page = doc.new_page(width=400, height=600)
@@ -95,10 +101,12 @@ print()
 print("=" * 78)
 print("2. 子进程协议（真实 QProcess，一轮请求-响应）")
 print("=" * 78)
+# 关键：env 里**不含** PYTHONIOENCODING（真实启动就是这样），路径又是中文——
+# 子进程若按 cp936 解码 stdin，这里就会报"找不到文件 / Invalid \escape"
 proc = subprocess.Popen(
     [sys.executable, "-u", os.path.join(PKG, "ocr_worker.py"), "--idle", "3"],
     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    cwd=PKG, text=True, encoding="utf-8")
+    cwd=PKG, text=True, encoding="utf-8", env=NO_IOENC)
 
 proc.stdin.write(json.dumps({"cmd": "ping"}) + "\n")
 proc.stdin.flush()
@@ -114,6 +122,10 @@ check("2.2 fake 引擎返回 3 个文字块", msg.get("ok") and len(msg.get("blo
 check("2.3 返回坐标已换算成页面坐标(pt)而非像素",
       msg["blocks"][0][2] <= msg["pw"] + 1 and msg["px_w"] > msg["pw"],
       f"块右边界={msg['blocks'][0][2]:.0f}pt 页宽={msg['pw']:.0f}pt 渲染宽={msg['px_w']}px")
+# 中文+全角括号路径必须原样打开（子进程 stdio 若不是 UTF-8，这里会变成找不到文件）
+check("2.3b 子进程按原样打开了中文路径的文件（页尺寸来自该文件）",
+      msg.get("ok") is True and abs(float(msg.get("pw", 0)) - 400) < 1,
+      f"pw={msg.get('pw')} ph={msg.get('ph')}")
 
 proc.stdin.write(json.dumps({"cmd": "ocr", "pdf": pdf, "page": 0,
                              "engine": "不存在的引擎"}) + "\n")
@@ -200,6 +212,18 @@ rects = win.viewer.text_overlay.block_rects()
 check("4.7 框能换算成屏幕矩形且落在页面内", len(rects) == 3 and all(r.width() > 5 for r in rects),
       f"首个框={rects[0].getRect() if rects else None}")
 
+# 回归：覆盖层曾经从没被设置过几何尺寸（默认 100x30 的小方块）→ 真实鼠标落不到它上面，
+# 拖选完全无效；而 QTest.mousePress(overlay, ...) 直接把事件发给控件，绕过了几何命中。
+# 所以这里断言几何铺满视口、且每个文字框都落在覆盖层内。
+vp_rect = win.viewer.scroll.viewport().rect()
+check("4.7b 选字层几何铺满整个视口",
+      win.viewer.text_overlay.geometry() == vp_rect,
+      f"覆盖层={win.viewer.text_overlay.geometry().getRect()} 视口={vp_rect.getRect()}")
+check("4.7c 每个文字框都落在选字层几何范围内（真实鼠标才能命中）",
+      all(vp_rect.contains(r.center()) and win.viewer.text_overlay.rect().contains(r.center())
+          for r in rects),
+      f"框中心示例={rects[0].center().toTuple() if rects else None}")
+
 # 拖选：从第一行拖到最后一行
 ov = win.viewer.text_overlay
 QTest.mousePress(ov, Qt.LeftButton, Qt.NoModifier, rects[0].center())
@@ -225,6 +249,25 @@ QTest.mouseDClick(ov, Qt.LeftButton, Qt.NoModifier, rects[1].center())
 app.processEvents()
 check("4.11 双击选中一整行（而不是整页）", ov.selected_range() == (1, 1),
       f"range={ov.selected_range()}")
+
+# 覆盖层现在铺满视口，必须确认它不会把滚轮吞掉（否则会用一个 bug 换另一个 bug）。
+# 注意：真实滚轮的"向上冒泡"发生在 Qt 的平台投递路径里，app.sendEvent 绕过它，
+# 所以这里断言的是契约本身——事件必须保持"未接受"，真实路径才会交给滚动区。
+win.viewer._set_zoom(2.0)          # 放大到内容高于视口，才有可滚动范围
+app.processEvents()
+QTest.qWait(120)
+vbar = win.viewer.scroll.verticalScrollBar()
+vbar.setValue(0)
+app.processEvents()
+from PySide6.QtCore import QPointF  # noqa: E402
+from PySide6.QtGui import QWheelEvent  # noqa: E402
+wheel = QWheelEvent(QPointF(60, 60), QPointF(60, 60), QPoint(0, 0), QPoint(0, -120),
+                    Qt.NoButton, Qt.NoModifier, Qt.NoScrollPhase, False)
+app.sendEvent(ov, wheel)
+app.processEvents()
+check("4.11b 选字层不吞滚轮（事件保持未接受，页面才滚得动）",
+      vbar.maximum() > 0 and not wheel.isAccepted(),
+      f"vbar 范围 0~{vbar.maximum()} 事件被接受={wheel.isAccepted()}")
 
 # 缓存命中：翻走再翻回来，不应重复提交识别请求
 win.viewer.goto_page(2)                     # 第 2 页（索引 1），之前没识别过

@@ -15,7 +15,8 @@ from typing import Dict, List, Optional, Tuple, Any
 import fitz  # PyMuPDF
 import numpy as np
 from PySide6.QtCore import (
-    Qt, QRect, QPoint, QUrl, QObject, Signal, QEvent, QTimer, QThreadPool, QRunnable, QProcess, Slot,
+    Qt, QRect, QPoint, QUrl, QObject, Signal, QEvent, QTimer, QThreadPool, QRunnable,
+    QProcess, QProcessEnvironment, Slot,
 )
 from PySide6.QtGui import (
     QImage,
@@ -1289,6 +1290,7 @@ class OcrClient(QObject):
         self._last_used = 0.0
         self._start_fail_count = 0
         self._stderr_tail = ""
+        self._closing = False               # 主动关停中：此时子进程被杀不算"异常退出"
         # 提交过的识别请求记录（诊断/测试用：能精确断言"某页只被提交过一次"）
         self.requests: List[int] = []
 
@@ -1415,6 +1417,12 @@ class OcrClient(QObject):
         proc.readyReadStandardOutput.connect(self._on_stdout)
         proc.readyReadStandardError.connect(self._on_stderr)
         proc.finished.connect(self._on_finished)
+        # 子进程环境里显式打开 UTF-8（PYTHONUTF8=1 让 open()/stdio 全走 UTF-8）：
+        # 中文路径曾经因为子进程 stdio 按 cp936 解码而变成"找不到文件 / Invalid \escape"
+        env = QProcessEnvironment.systemEnvironment()
+        env.insert("PYTHONUTF8", "1")
+        env.insert("PYTHONIOENCODING", "utf-8")
+        proc.setProcessEnvironment(env)
         # --idle：空闲一段时间后子进程自己退出，把模型内存还给系统
         proc.start(sys.executable, [self.worker_path, "--idle", str(self.idle_kill_s)])
         if not proc.waitForStarted(5000):
@@ -1422,6 +1430,7 @@ class OcrClient(QObject):
             self.failed.emit("OCR 子进程启动失败")
             return False
         self.process = proc
+        self._closing = False       # 新进程起来了：恢复正常状态
         if not self._idle_timer.isActive():
             self._idle_timer.start()
         return True
@@ -1478,6 +1487,10 @@ class OcrClient(QObject):
     def _on_finished(self, code, status):
         self._inflight = None
         self._pending.clear()
+        if self._closing:
+            # 正常关停：子进程可能正忙着识别（预取），它被 quit/kill 掉是预期行为，
+            # 不能报成"OCR 失败"去吓用户
+            return
         if code not in (0, None) and self._start_fail_count < 3:
             tail = self._stderr_tail.strip().splitlines()
             hint = tail[-1] if tail else f"退出码 {code}"
@@ -1496,6 +1509,7 @@ class OcrClient(QObject):
 
     def shutdown(self, kill_process: bool = False):
         """窗口关闭/切换状态时调用：让子进程退出、关闭数据库。"""
+        self._closing = True
         self._timer.stop()
         self._idle_timer.stop()
         if self.process is not None:
@@ -1503,7 +1517,8 @@ class OcrClient(QObject):
                 if self.process.state() == QProcess.Running:
                     self.process.write(b'{"cmd":"quit"}\n')
                     self.process.waitForBytesWritten(500)
-                    if not self.process.waitForFinished(1500):
+                    # 子进程可能正在识别一页（关窗前它在跑预取），给它一点时间做完再杀
+                    if not self.process.waitForFinished(2500):
                         self.process.kill()
                         self.process.waitForFinished(1000)
             except Exception:
@@ -1651,6 +1666,15 @@ class TextSelectOverlay(QWidget):
 
     def mouseDoubleClickEvent(self, event):
         self.mousePressEvent(event)
+
+    def wheelEvent(self, event):
+        """滚轮明确交给滚动区。
+
+        选字层铺满整个视口，如果它把滚轮"吃"掉，页面就再也滚不动了。
+        Qt 对**被忽略**的事件会沿父级链继续投递（真实滚轮由 QWidgetWindow 走这条路径），
+        这里显式 ignore 把契约写明白，也让测试可以断言。
+        """
+        event.ignore()
 
     # ---- 绘制 ----
     def paintEvent(self, event):
@@ -2431,6 +2455,8 @@ class PdfViewer(QWidget):
             self.crop_overlay.reset_marks()
             self.crop_marks_top = None
             self.crop_marks_bottom = None
+        # 选字层要跟着让位：它铺满视口，留在上面会把分割线的点击抢走
+        self.sync_text_overlay()
 
     def stop_crop_mode(self):
         self.set_crop_mode(False)
@@ -2451,6 +2477,7 @@ class PdfViewer(QWidget):
             self.crop_overlay.start_cover()
         else:
             self.crop_overlay.stop_cover()
+        self.sync_text_overlay()
 
     def stop_cover_mode(self):
         self.set_cover_mode(False)
@@ -2821,6 +2848,11 @@ class PdfViewer(QWidget):
         overlay = getattr(self, "text_overlay", None)
         if overlay is None:
             return
+        # 必须跟着视口改尺寸：覆盖层是视口的子控件，几何不对的话鼠标根本落不到它上面
+        # （曾经漏了这一步 → 它一直是默认 100x30 的小方块，真实拖选完全无效；
+        #   测试里 QTest.mousePress(overlay, ...) 直接把事件发给控件，绕过了几何命中，
+        #   所以当时的测试是绿的——现在的测试会断言几何覆盖整个视口。）
+        overlay.setGeometry(self.scroll.viewport().rect())
         overlay.sync_visibility()
         overlay.update()
 
