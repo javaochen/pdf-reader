@@ -69,7 +69,7 @@ def wait_for(predicate, timeout_ms=8000, step=100):
 # 问题暴露的场景（全 ASCII 路径的测试抓不到它）
 pdf = os.path.join(TMP, "测试（中文）书.pdf")
 doc = fitz.open()
-for i in range(4):
+for i in range(20):        # 页数要超过 OCR_MEMORY_PAGES，才能测出"内存里有上限"
     page = doc.new_page(width=400, height=600)
     page.insert_text((60, 90), f"page {i+1}")
     page.draw_rect(fitz.Rect(50, 60, 350, 500), color=(0, 0, 0), width=1)
@@ -296,6 +296,25 @@ prefetched = wait_for(lambda: win.ocr.has_page(1) and win.viewer.current_page_in
                       timeout_ms=20000)
 check("4.15 停在某页时会自动预取下一页（翻过去即可直接选字）",
       first_ok and prefetched, f"已识别页={sorted(win.ocr._done)}")
+
+# 无界增长回归：一路识别下去，内存里的文字框字典必须有上限
+# （曾经识别结果那条路忘了清理，300 页就堆 300 条）
+for p in range(1, 26):
+    win.viewer.goto_page(p)
+    app.processEvents()
+    deadline = time.time() + 2
+    while time.time() < deadline:
+        app.processEvents()
+        if win.ocr.has_page(win.viewer.current_page_index):
+            break
+        QTest.qWait(10)
+check("4.16 内存里保留的文字框页数有上限（不会随识别页数无限增长）",
+      len(win.ocr._blocks) <= R.OCR_MEMORY_PAGES + 1,
+      f"已识别 {len(win.ocr._done)} 页，内存里只留 {len(win.ocr._blocks)} 页"
+      f"（上限 {R.OCR_MEMORY_PAGES}）")
+check("4.17 被挤出内存的页仍能从缓存取回文字框",
+      win.ocr.blocks(0) is not None and len(win.ocr.blocks(0)) == 3,
+      f"第 1 页取回 {len(win.ocr.blocks(0) or [])} 块")
 
 print()
 print("=" * 78)

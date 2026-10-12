@@ -182,11 +182,15 @@ def _cfg_int(key: str, default: int, lo: int, hi: int) -> int:
 OCR_ENABLED_DEFAULT = False
 OCR_ENABLED = _cfg_bool("ocr_enabled", OCR_ENABLED_DEFAULT)
 OCR_ENGINE = str(_cfg("ocr_engine", "rapidocr"))        # rapidocr / windows / fake
-OCR_LONG_SIDE = _cfg_int("ocr_long_side", 1600, 600, 4000)   # 识别输入长边（实测 1600 够用）
+# 识别输入的长边像素。实测（谢惠民，同一页）：
+#   1000px → 253MB / 质量偏糊；1200px → 239MB / 质量正常；1600px → 401MB；2000px → 569MB
+# 耗时几乎不随尺度变化（瓶颈在模型本身），而内存线性上升，所以默认取 1200。
+OCR_LONG_SIDE = _cfg_int("ocr_long_side", 1200, 600, 4000)
 OCR_DEBOUNCE_MS = _cfg_int("ocr_debounce_ms", 400, 0, 5000)  # 翻页停稳多久才提交识别
 OCR_IDLE_KILL_S = _cfg_int("ocr_idle_kill_s", 120, 10, 3600)  # 空闲多久杀掉子进程（归还内存）
 OCR_CACHE_DIR = Path(str(_cfg("ocr_cache_dir", Path(STATE_DIR) / "ocr")))
 OCR_CACHE_KEEP = 60                   # 缓存最多保留多少本书的库（防止无限增长）
+OCR_MEMORY_PAGES = 12                 # 内存里最多保留多少页的文字框（其余随时从库读回）
 OCR_WORKER = str(APP_DIR / "ocr_worker.py")
 
 # 图标优先用包内 assets/reader.ico（随包发布）；缺失时返回空串，使用 Qt 默认图标
@@ -1321,16 +1325,26 @@ class OcrClient(QObject):
         self._done = self.store.load_page_set()
 
     # ---- 查询（覆盖层/状态栏用，纯内存） ----
+    def _remember_blocks(self, page_index: int, blocks: list):
+        """把某页的文字框放进内存字典，并**限制保留页数**。
+
+        实测教训：只有"从磁盘读缓存"那条路做了清理，识别结果那条路忘了清理，
+        于是一路翻下去 `_blocks` 会随识别页数无限增长（300 页 ≈ 1~2MB，
+        整本 1780 页 ≈ 6~12MB）。文字框随时能从 SQLite 取回，没必要常驻。
+        """
+        self._blocks.pop(page_index, None)
+        self._blocks[page_index] = blocks          # dict 保序：重新插入 = 移到最新
+        while len(self._blocks) > OCR_MEMORY_PAGES:
+            oldest = next(iter(self._blocks))
+            self._blocks.pop(oldest, None)
+
     def blocks(self, page_index: int) -> Optional[list]:
         if page_index in self._blocks:
             return self._blocks[page_index]
         if self.store is not None and page_index in self._done:
             got = self.store.get_page(page_index)
             if got:
-                # 只把最近看过的页留在内存里，避免整本书的框堆在内存
-                if len(self._blocks) > 8:
-                    self._blocks.clear()
-                self._blocks[page_index] = got["blocks"]
+                self._remember_blocks(page_index, got["blocks"])
                 return got["blocks"]
         return None
 
@@ -1466,7 +1480,7 @@ class OcrClient(QObject):
             blocks = msg.get("blocks") or []
             if page is not None:
                 self._done.add(int(page))
-                self._blocks[int(page)] = blocks
+                self._remember_blocks(int(page), blocks)
                 if self.store is not None:
                     self.store.put_page(int(page), msg.get("pw", 0.0), msg.get("ph", 0.0),
                                         msg.get("engine", self.engine),
