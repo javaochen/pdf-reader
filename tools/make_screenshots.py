@@ -194,6 +194,7 @@ win.resize(1500, 900)
 win.show()
 win.splitter.setSizes([190, 900, 410])       # 左：书签　中：页面　右：速记
 win.open_pdf(book, 1)
+win.show_side_panel(0)      # 右侧栏默认隐藏：截图时打开「速记」页
 app.processEvents()
 QTest.qWait(250)
 

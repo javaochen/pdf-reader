@@ -6,10 +6,6 @@
   "initial_page": 1,
   "notes_file": "notes.md",
   "invert": false,
-  "ocr_enabled": false,
-  "ocr_engine": "rapidocr",
-  "ocr_long_side": 1600,
-  "ocr_debounce_ms": 400,
-  "ocr_idle_kill_s": 120,
-  "ocr_cache_dir": null
+  "captures_dir": "captures",
+  "captures_max": 200
 }

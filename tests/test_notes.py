@@ -166,13 +166,20 @@ win.open_pdf(pdf, 1)
 app.processEvents()
 QTest.qWait(150)
 
-check("5.2 主窗口带速记栏且默认可见",
-      win.notes_panel.isVisible() and win.splitter.count() == 3,
-      f"分隔数={win.splitter.count()} 可见={win.notes_panel.isVisible()}")
+check("5.2 主窗口带右侧栏（速记/暂存两个页签）且默认隐藏",
+      win.splitter.count() == 3 and win.side_panel.count() == 2
+      and [win.side_panel.tabText(i) for i in range(2)] == ["速记", "暂存"]
+      and not win.side_panel.isVisible(),
+      f"分隔数={win.splitter.count()} 页签={win.side_panel.count()} "
+      f"可见={win.side_panel.isVisible()}")
 win.toggle_notes_panel()
-hidden = not win.notes_panel.isVisible()
+shown = win.side_panel.isVisible() and win.side_panel.currentIndex() == 0
 win.toggle_notes_panel()
-check("5.3 切换方法能隐藏/再显示", hidden and win.notes_panel.isVisible())
+hidden = not win.side_panel.isVisible()
+win.toggle_notes_panel()
+check("5.3 速记栏按一次打开（切到速记页）、再按一次收起", shown and hidden
+      and win.side_panel.isVisible() and win.side_panel.currentIndex() == 0,
+      f"打开={shown} 收起={hidden}")
 
 name, page = win.notes_context()
 check("5.4 位置上下文取到当前书名与页码", name == "t.pdf" and page == 1, f"{name} / 第 {page} 页")

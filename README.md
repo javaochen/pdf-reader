@@ -38,9 +38,8 @@
   「插入位置」一键记下当前书名与页码，便于回溯原文
 - **反色显示**（`Ctrl+Shift+I`）：白底黑字 ↔ 黑底白字，夜间看扫描件不刺眼。
   只改显示配色——**截取输出与去白边判定仍按原始像素**，发给 AI 的图永远是白底黑字
-- **OCR 选字**（`Ctrl+Shift+O`，默认关闭）：识别出的文字可以**拖选、`Ctrl+C` 复制**。
-  识别在**独立子进程**里于页面稳定后后台进行（不阻塞翻页、模型内存不占阅读器），
-  结果按页缓存并自动预取下一页；**关掉后完全零开销**
+- **右侧栏（`Ctrl+N` 速记 / `Ctrl+Shift+X` 截取暂存）**：默认不占地方，按需打开；
+  暂存页把每次截取的图连出处一起列成缩略图，**点一下即复制**，支持批量清理
 - 书签目录导航、阅读进度自动恢复、书签导出 Markdown、命令面板、快速切换 PDF
 - 发布友好：不含任何机器路径，默认扫描**你自己**的「下载」文件夹，配置见下
 
@@ -73,14 +72,13 @@ copy reader_config.example.json reader_config.json     # Windows
 | `pdf_root_dir` | `PDF_READER_PDF_ROOT_DIR` | 系统「下载」文件夹 | 启动时扫描/打开的 PDF 目录 |
 | `state_dir` | `PDF_READER_STATE_DIR` | 同 `pdf_root_dir` | 阅读进度、最近打开记录的存放目录 |
 | `notes_file` | `PDF_READER_NOTES_FILE` | `notes.md`（程序目录） | 速记文件；相对路径按程序目录解析 |
+| `captures_dir` | `PDF_READER_CAPTURES_DIR` | `captures`（程序目录） | 截取暂存目录 |
+| `captures_max` | `PDF_READER_CAPTURES_MAX` | `200` | 暂存最多保留条数（超出自动清最旧） |
 | `invert` | `PDF_READER_INVERT` | `false` | 启动即反色显示（夜间看扫描件） |
-| `ocr_enabled` | `PDF_READER_OCR_ENABLED` | `false` | 启动即开启 OCR 选字 |
-| `ocr_engine` | `PDF_READER_OCR_ENGINE` | `rapidocr` | 识别引擎：`rapidocr`（质量好）/ `windows`（系统自带，快） |
-| `ocr_long_side` | `PDF_READER_OCR_LONG_SIDE` | `1600` | 识别输入长边像素（实测 1600 足够，再大只变慢） |
 | `initial_pdf_keyword` | `PDF_READER_INITIAL_PDF_KEYWORD` | 空 | 启动时按文件名关键字自动打开 |
 | `initial_page` | `PDF_READER_INITIAL_PAGE` | `1` | 无历史记录时的起始页 |
 
-其余 OCR 参数（`ocr_debounce_ms`、`ocr_idle_kill_s`、`ocr_cache_dir`）见 [docs/USAGE.md](docs/USAGE.md)。
+其余参数（`captures_dir`、`captures_max`）见 [docs/USAGE.md](docs/USAGE.md)。
 
 默认目录是**运行时算出来的**（仓库里不含任何机器路径）：Windows 先读注册表里系统认定的
 「下载」文件夹（被移动过位置也能找到），拿不到再依次退回 `~/Downloads` → `~/Documents` → 用户主目录。
@@ -100,7 +98,6 @@ copy reader_config.example.json reader_config.json     # Windows
 ```
 pdf_reader/
 ├─ reader.py                    # 主程序（入口）
-├─ ocr_worker.py                # OCR 子进程（独立进程，模型内存隔离在这里）
 ├─ requirements.txt             # 运行依赖
 ├─ reader_config.example.json   # 配置模板
 ├─ run.bat                      # Windows 双击启动
@@ -108,7 +105,8 @@ pdf_reader/
 ├─ notes.md                     # 速记（运行时自动创建，已 gitignore）
 ├─ assets/reader.ico            # 窗口图标
 ├─ docs/                        # 使用说明 / 设计文档 / 截图
-├─ tests/                       # 七套无头回归测试（193 项）
+├─ captures/                    # 截取暂存（运行时创建，已 gitignore）
+├─ tests/                       # 七套无头回归测试（173 项）
 └─ tools/make_screenshots.py    # 重新生成 README 截图
 ```
 

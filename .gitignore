@@ -6,6 +6,9 @@ __pycache__/
 # 本地配置（含个人路径，不要发布）
 reader_config.json
 
+# 截取暂存（个人内容，绝不发布）
+captures/
+
 # 速记（个人内容，绝不发布）
 notes.md
 notes_local.md
