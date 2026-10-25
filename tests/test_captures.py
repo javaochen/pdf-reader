@@ -24,6 +24,7 @@ os.environ["PDF_READER_STATE_DIR"] = TMP
 os.environ["PDF_READER_NOTES_FILE"] = os.path.join(TMP, "notes.md")
 os.environ["PDF_READER_CAPTURES_DIR"] = CAPS
 
+import app_config  # noqa: E402,F401  # 必须先于 fitz / PySide6：补 Windows 运行库搜索路径
 import fitz  # noqa: E402
 from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtGui import QColor, QPixmap  # noqa: E402

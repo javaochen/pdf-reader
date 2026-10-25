@@ -23,8 +23,10 @@ os.environ["PDF_READER_PDF_ROOT_DIR"] = TMP
 os.environ["PDF_READER_STATE_DIR"] = TMP
 os.environ["PDF_READER_NOTES_FILE"] = os.path.join(TMP, "notes.md")
 
+import app_config  # noqa: E402,F401  # 必须先于 fitz / PySide6：补 Windows 运行库搜索路径
 import fitz  # noqa: E402
 from PySide6.QtCore import Qt  # noqa: E402
+from PySide6.QtGui import QTextCursor  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
@@ -92,7 +94,7 @@ print("=" * 78)
 print("3. 位置标记")
 print("=" * 78)
 panel.editor.setPlainText("")
-panel.editor.moveCursor(R.QTextCursor.End)
+panel.editor.moveCursor(QTextCursor.End)
 panel.insert_location_marker()
 text = panel.editor.toPlainText()
 check("3.1 空文档插入标记不带多余空行",
@@ -100,7 +102,7 @@ check("3.1 空文档插入标记不带多余空行",
       repr(text[:48]))
 check("3.2 标记含书名与页码", "拓扑学.pdf" in text and "第 42 页" in text, repr(text[:60]))
 
-panel.editor.moveCursor(R.QTextCursor.End)
+panel.editor.moveCursor(QTextCursor.End)
 panel.insert_location_marker()
 # 同一分钟内书名页码也相同 → 两条标记文本可以完全一样，这里只校验格式与行数
 lines = [ln for ln in panel.editor.toPlainText().splitlines() if ln.strip()]

@@ -22,9 +22,10 @@ os.environ["PDF_READER_PDF_ROOT_DIR"] = TMP
 os.environ["PDF_READER_STATE_DIR"] = TMP
 os.environ["PDF_READER_NOTES_FILE"] = os.path.join(TMP, "notes.md")
 
+import app_config  # noqa: E402,F401  # 必须先于 fitz / PySide6：补 Windows 运行库搜索路径
 import fitz  # noqa: E402
 from PySide6.QtCore import Qt  # noqa: E402
-from PySide6.QtGui import QShortcut  # noqa: E402
+from PySide6.QtGui import QImage, QShortcut  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
@@ -52,16 +53,16 @@ def mean_brightness(pixmap):
     """平均亮度。注意：qimage_to_rgb_array 返回的是 img 缓冲区的视图，
     转换结果必须先绑定到局部变量，否则临时对象被回收后会读到已释放内存（会崩）。"""
     img = pixmap.toImage()
-    if img.format() != R.QImage.Format_RGB888:
-        img = img.convertToFormat(R.QImage.Format_RGB888)
+    if img.format() != QImage.Format_RGB888:
+        img = img.convertToFormat(QImage.Format_RGB888)
     return float(R.qimage_to_rgb_array(img).mean())
 
 
 def dark_fraction(pixmap):
     """暗像素占比：白底黑字的原图应远小于黑底白字的反色图。"""
     img = pixmap.toImage()
-    if img.format() != R.QImage.Format_RGB888:
-        img = img.convertToFormat(R.QImage.Format_RGB888)
+    if img.format() != QImage.Format_RGB888:
+        img = img.convertToFormat(QImage.Format_RGB888)
     return float((R.qimage_to_rgb_array(img).mean(axis=2) < 70).mean())
 
 
@@ -220,9 +221,11 @@ check("5.2 触发该快捷键确实切换反色", win.viewer.invert_enabled != b
 check("5.3 状态栏提示只改显示、不影响截取",
       "截取输出仍是原样" in win.status.currentMessage(), win.status.currentMessage())
 
-names = [c[0] for c in R.MainWindow.EXTRA_COMMANDS]
+actions = win.get_command_actions()
 keys = [k for k, *_ in R.MainWindow.SKEY if isinstance(k, str)]
-check("5.4 命令面板里有「反色显示」", "反色显示" in names, f"命令数={len(names)}")
+inverts = [a for a in actions if a[0] == "反色显示"]
+check("5.4 命令面板里有「反色显示」且只有一条",
+      len(inverts) == 1 and inverts[0][3] == "Ctrl+Shift+I", f"命令数={len(actions)}")
 check("5.5 快捷键表里有 Ctrl+Shift+I", "Ctrl+Shift+I" in keys)
 win.close()
 app.processEvents()

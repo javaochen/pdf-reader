@@ -29,6 +29,7 @@ os.environ["PDF_READER_PDF_ROOT_DIR"] = TMP
 os.environ["PDF_READER_STATE_DIR"] = TMP
 sys.path.insert(0, PKG)
 
+import app_config  # noqa: E402,F401  # 必须先于 fitz / PySide6：补 Windows 运行库搜索路径
 import fitz
 import numpy as np
 from PySide6.QtCore import QRect
@@ -37,6 +38,10 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 import reader as R
+# 模块拆分后常量住在各自模块里：改 R.XXX 只是改 reader 的名字，真正判定的还是
+# viewer / main_window 里的那份。要测"预算收紧后真的逐出"，就得改这两个模块。
+import main_window as MW
+import viewer as V
 
 FAILS = []
 
@@ -122,14 +127,14 @@ class no_prefetch:
         self.viewer = viewer
 
     def __enter__(self):
-        self._old = R.PREFETCH_PAGES
-        R.PREFETCH_PAGES = 0
+        self._old = V.PREFETCH_PAGES
+        V.PREFETCH_PAGES = 0
         self.viewer._prefetch_pool.waitForDone(5000)
         app.processEvents()
         return self
 
     def __exit__(self, *exc):
-        R.PREFETCH_PAGES = self._old
+        V.PREFETCH_PAGES = self._old
         return False
 
 
@@ -285,8 +290,8 @@ print()
 print("=" * 78)
 print("5. 页面缓存：按字节限制，截取不污染缓存")
 print("=" * 78)
-original_budget = R.PAGE_CACHE_MAX_BYTES
-R.PAGE_CACHE_MAX_BYTES = 6 * 1024 * 1024
+original_budget = V.PAGE_CACHE_MAX_BYTES
+V.PAGE_CACHE_MAX_BYTES = 6 * 1024 * 1024
 try:
     viewer.set_auto_crop_enabled(False)
     viewer.set_fit_page_mode(False)
@@ -295,12 +300,12 @@ try:
         viewer.goto_page(p)
         viewer.zoom = 0.9 + 0.1 * p
         viewer.render_current_page()
-    check("5.1 缓存字节数不超过预算", viewer._page_cache_bytes <= R.PAGE_CACHE_MAX_BYTES,
-          f"{viewer._page_cache_bytes / 1e6:.1f}MB / {R.PAGE_CACHE_MAX_BYTES / 1e6:.1f}MB")
+    check("5.1 缓存字节数不超过预算", viewer._page_cache_bytes <= V.PAGE_CACHE_MAX_BYTES,
+          f"{viewer._page_cache_bytes / 1e6:.1f}MB / {V.PAGE_CACHE_MAX_BYTES / 1e6:.1f}MB")
     check("5.2 字节计数与实际条目吻合",
           viewer._page_cache_bytes == sum(viewer._pixmap_bytes(v) for v in viewer.page_cache.values()))
 finally:
-    R.PAGE_CACHE_MAX_BYTES = original_budget
+    V.PAGE_CACHE_MAX_BYTES = original_budget
 
 viewer.set_auto_crop_enabled(True)
 viewer.set_fit_page_mode(True)
@@ -363,23 +368,23 @@ batch.set_crop_marks((0, 100), (R.MAX_CAPTURE_PAGES + 5, 300))
 batch.copy_crop_to_clipboard()
 check("7.1 跨页过多被拦下", any("跨页过多" in m for m in messages), str(messages[-1:] if messages else []))
 
-original_max_px = R.MAX_CAPTURE_PIXELS
-R.MAX_CAPTURE_PIXELS = 1000
+original_max_px = V.MAX_CAPTURE_PIXELS
+V.MAX_CAPTURE_PIXELS = 1000
 try:
     messages.clear()
     batch.set_crop_marks((0, 100), (0, 300))
     batch.copy_crop_to_clipboard()
     check("7.2 输出像素超限被拦下", any("范围过大" in m for m in messages), str(messages[-1:] if messages else []))
 finally:
-    R.MAX_CAPTURE_PIXELS = original_max_px
+    V.MAX_CAPTURE_PIXELS = original_max_px
 
 print()
 print("=" * 78)
 print("8. 配置项 INITIAL_PAGE 生效")
 print("=" * 78)
-original_initial = R.INITIAL_PAGE
+original_initial = MW.INITIAL_PAGE
 try:
-    R.INITIAL_PAGE = 4
+    MW.INITIAL_PAGE = 4
     fresh = R.MainWindow()          # 构造时自动打开的页会进内存历史
     OPEN_VIEWERS.append(fresh.viewer)
     fresh.status.showMessage = lambda *a, **k: None
@@ -390,7 +395,7 @@ try:
           f"第 {fresh.viewer.current_page_1_based()} 页")
     fresh.close()
 finally:
-    R.INITIAL_PAGE = original_initial
+    MW.INITIAL_PAGE = original_initial
 
 win.close()
 if "fresh" in dir():

@@ -23,6 +23,7 @@ os.environ["PDF_READER_PDF_ROOT_DIR"] = TMP
 os.environ["PDF_READER_STATE_DIR"] = TMP
 sys.path.insert(0, PKG)
 
+import app_config  # noqa: E402,F401  # 必须先于 fitz / PySide6：补 Windows 运行库搜索路径
 import fitz
 import numpy as np
 from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
