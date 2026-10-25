@@ -46,6 +46,7 @@ SAMPLE_NOTES = """# 第 3 章 中值定理
 with open(os.environ["PDF_READER_NOTES_FILE"], "w", encoding="utf-8") as _f:
     _f.write(SAMPLE_NOTES)
 
+import app_config  # noqa: F401  # 必须先于 fitz / PySide6：补 Windows 运行库搜索路径
 import fitz
 from PySide6.QtCore import QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QFontMetrics, QImage, QPainter, QPen
@@ -240,9 +241,9 @@ shoot(win, "02-capture-mode.png", 1200)
 
 win.toggle_crop_mode()
 app.processEvents()
-dlg = R.ShortcutListDialog(win.SKEY, win)
+dlg = R.ShortcutListDialog(win.SKEY + win._tab_number_rows(), win)
 dlg.setAttribute(Qt.WA_DontShowOnScreen, True)
-dlg.resize(560, 620)
+dlg.resize(560, 700)
 dlg.show()
 app.processEvents()
 QTest.qWait(200)
@@ -267,6 +268,27 @@ to_top()
 app.processEvents()
 QTest.qWait(200)
 shoot(win, "05-invert.png", 1200)
+
+# 标签页：同一本书开两个标签页放不同页（标题带页码，正好演示"对照"）
+win.viewer.set_invert_enabled(False)
+win.open_in_new_tab(book, 4)
+win.side_panel.hide()             # 收起右栏，让页签与两个页面看得清
+win.viewer.fit_width()
+to_top()
+app.processEvents()
+QTest.qWait(250)
+shoot(win, "06-tabs.png", 1200)
+
+# 命令面板：在搜索框里敲关键字后的样子（输入框有焦点，↑↓ + 回车即可执行）
+cmd_dlg = R.CommandDialog(win.get_command_actions(), win)
+cmd_dlg.setAttribute(Qt.WA_DontShowOnScreen, True)
+cmd_dlg.resize(780, 520)
+cmd_dlg.show()
+cmd_dlg.input.setText("标签")
+app.processEvents()
+QTest.qWait(220)
+shoot(cmd_dlg, "07-commands.png")
+cmd_dlg.close()
 
 win.close()
 app.processEvents()
