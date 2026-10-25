@@ -31,17 +31,18 @@
 
 ## 代码结构
 
-单文件 `reader.py`（约 3300 行），按职责自上而下分块：
+按职责拆成 6 个同目录模块，`reader.py` 只负责启动并重新导出公开名字：
 
-| 区块 | 内容 |
+| 文件 | 内容 |
 |---|---|
-| 配置层 | `load_config` / `_cfg` / `_cfg_bool` / `_cfg_int` / `default_downloads_dir` / `resolve_notes_path`：配置优先级与默认路径解析（无机器路径） |
-| 图像算法 | `rgb_to_gray`、`content_row_col_hits`、`find_content_bbox_arr`、`estimate_background_level`、`adaptive_white_threshold`、`qimage_to_rgb_array`、`invert_qimage`、`safe_crop_box` |
-| 持久化 | `HistoryStore`（最后页码）、`RecentStore`（最近打开）、`CaptureStore`（截取暂存：文件 + 索引 + 缩略图） |
-| 对话框 | `ShortcutListDialog`、`HelpDialog`、`BookmarkCopyDialog`、`QuickSwitchDialog`、`JumpPageDialog`、`CommandDialog` |
-| 界面部件 | `BookmarkPanel`、`NotesPanel`（右侧速记，自动落盘）、`CropOverlay`（截取/遮挡覆盖层）、`PdfViewer`（渲染 + 缓存 + 截取）、`MainWindow`（快捷键/命令注册、状态落盘） |
-| 右侧栏 | `NotesPanel`（速记）、`CapturePanel`（暂存缩略图，点一下复制） |
-| 后台任务 | `_PrefetchTask`（QRunnable，只产出 QImage，QPixmap 回主线程） |
+| `app_config.py` | 配置层：`load_config` / `_cfg` / `_cfg_bool` / `_cfg_int` / `default_downloads_dir` / `resolve_notes_path`，全部常量，以及 Windows 运行库兼容处理 |
+| `imaging.py` | 图像算法：`rgb_to_gray`、`content_row_col_hits`、`find_content_bbox_arr`、`estimate_background_level`、`adaptive_white_threshold`、`qimage_to_rgb_array`、`invert_qimage`、`safe_crop_box` |
+| `stores.py` | 持久化：`HistoryStore`（最后页码）、`RecentStore`（最近打开）、`CaptureStore`（截取暂存：文件 + 索引 + 缩略图） |
+| `ui_panels.py` | 对话框：`ShortcutListDialog`、`HelpDialog`、`BookmarkCopyDialog`、`QuickSwitchDialog`、`JumpPageDialog`、`CommandDialog`；侧栏：`BookmarkPanel`、`NotesPanel`（速记，自动落盘）、`CapturePanel`（暂存缩略图） |
+| `viewer.py` | 阅读区：`CropOverlay`（截取/遮挡覆盖层）、`_PrefetchTask`（QRunnable，只产出 QImage）、`PdfViewer`（渲染 + 缓存 + 截取） |
+| `main_window.py` | 主窗口：标签页（每个标签页一个 `PdfViewer`，`self.viewer` 指向当前页）、快捷键/命令注册、状态落盘 |
+
+依赖方向是单向的：`app_config` ← `imaging` / `stores` ← `ui_panels` / `viewer` ← `main_window` ← `reader`。
 
 关键约定：
 
@@ -69,6 +70,8 @@
 | 速记落盘 | 停止输入 800 ms 后写盘（`NOTES_SAVE_DEBOUNCE_MS`），关窗 `flush()` 兜底；写盘走"临时文件 + `os.replace`"原子替换，崩溃不会把笔记截成半截；载入限 2 MB、写失败在面板状态行标红而不是静默 |
 | 截取暂存 | 截取成功后另存一份到 `captures/`（原图 + 缩略图 + 索引 JSON）；文件名只用时间戳与随机后缀，书名/页码进索引；超出条数或字节上限从最旧删；载入时跳过缺失文件并清扫孤儿缩略图 |
 | 上限保护 | 单次跨页截取最多 50 页、输出最多 2 亿像素，超限直接提示而不是拼出 GB 级位图 |
+| 标签页 | 一个标签页一个 `PdfViewer`：文档、页码、缩放、截取状态天然隔离，`self.viewer` 只作为"当前标签页"指针由 `_on_tab_changed` 统一同步。切走的标签立即释放页面缓存与屏幕上那张位图（只清 QLabel 的位图、不动标签尺寸，滚动位置才不会跳回顶部），文档与内容框缓存保留，切回来重渲染但不重算白边。上限 `MAX_TABS`（默认 8）；标题按 `TAB_TITLE_MAX_PX`（200px）中间省略，长书名不撑满页签栏 |
+| 命令面板 | 动作表只有一个来源：`SKEY`（有键位）+ `EXTRA_COMMANDS`（无键位）；`get_command_actions()` 按回调去重，重复时优先保留带键位的那条，所以同一个功能不会出现两次。面板支持名称/说明/快捷键三处匹配、空格分词、↑↓ 选择、回车执行 |
 
 ## 实测数据
 
@@ -86,7 +89,7 @@
 
 ## 测试
 
-六套无头回归测试，**不需要显示器**（自动用 Qt `offscreen` 平台），共 173 项。
+九套无头回归测试，**不需要显示器**（自动用 Qt `offscreen` 平台），共 256 项。
 测试会把 PDF 目录、状态目录、速记文件与截取暂存都指向包内临时目录，不会扫描或写入用户的真实数据。
 
 ```bash
@@ -96,6 +99,8 @@ python tests/test_math_reading.py      # 原生分辨率/抗噪阈值/预取/视
 python tests/test_invert.py            # 反色只影响显示、不污染截取（23 项）
 python tests/test_notes.py             # 速记自动落盘/防抖/右侧栏开关（25 项）
 python tests/test_captures.py          # 截取暂存：落盘/索引/清理/面板交互（26 项）
+python tests/test_tabs.py              # 标签页：独立状态/标签内换书/缓存释放/上限/标题省略（59 项）
+python tests/test_commands.py          # 命令面板：动作去重/搜索/键盘执行（24 项）
 python tests/test_nav.py               # 书签相对导航（12 例）
 ```
 
@@ -105,6 +110,15 @@ python tests/test_nav.py               # 书签相对导航（12 例）
 `WA_DontShowOnScreen` 的窗口永远不是 active（实测 `isActiveWindow()` 恒为 False，
 所有 Ctrl 类快捷键都不派发）。因此涉及快捷键的断言直接驱动对应 `QShortcut` 的
 `activated` 信号，验证"已注册 + 接到了正确回调"，而不是依赖平台派发。
+
+另一条环境限制（2026-10 实测）：测试脚本必须**先 `import app_config`、再 `import fitz`/`PySide6`**。
+顺序反了会在创建 `QApplication` 时直接 access violation（`0xC0000005`，无 traceback）——
+PyMuPDF 2.x 导入时要加载 onnxruntime，依赖 shiboken6 自带的更新版 MSVC 运行库，
+而补 DLL 搜索路径的正是 `app_config`。八套测试与截图脚本都按这个顺序写。
+
+另外，模块拆分后常量住在各自模块里（`viewer.PAGE_CACHE_MAX_BYTES`、
+`main_window.INITIAL_PAGE` 等）；测试要临时改预算/上限，必须改**那个模块的属性**，
+改 `reader.XXX` 只是改了 reader 里的同名引用，判定逻辑读不到。
 
 建议**逐套顺序执行**而不是并发跑：`test_capture_autocrop` 会做 300 DPI 级别的图像比对，
 峰值内存约 300 MB；`test_math_reading` 会构造大页面样例（约 280 MB）。
@@ -123,6 +137,12 @@ python tests/test_nav.py               # 书签相对导航（12 例）
 - 反色：显示路径确实换色（白纸↔黑块互换）、关掉后逐像素恢复原样（缓存键含反色）、
   **无损截取与精确渲染路径永远是原始白底黑字**、内容框探测仍按原始像素工作、
   预取结果与当前配色一致且键里带反色标记、状态栏标出反色
+- 标签页：每个页签的书/页码/缩放互不干扰（同一本书开两个也分得清）、`Ctrl+O` 只换当前页签的文件、
+  新页签失败不残留空标签、超出 `MAX_TABS` 被拒、切走的页签位图缓存与显示位图都释放而页码与文档保留、
+  切回来自动重渲染且滚动位置不丢、关闭最后一个页签只清空、`F5` 只清掉文件已消失的页签、
+  `Ctrl+T/W/Tab/Shift+Tab` 与 `Alt+1…9` 已注册且指向正确的页签、长书名的标签标题按像素中间省略且保留页码
+- 命令面板：动作表按回调去重（同一功能不会出现两条）、保留带键位的那条、按名称/说明/快捷键搜索、
+  空格分词、↑↓ 选择、回车执行、无匹配时占位项不可执行
 
 ## 打包发布
 
@@ -160,7 +180,8 @@ python tools/make_screenshots.py        # 输出到 docs/screenshots/
 - 反色是**纯反色**（`255−x`），没有做"降白 / 护眼暖色 / 可调对比度"这类更温和的夜间方案：
   灰底扫描件反色后对比度会偏高，若需要可以再加一档"只压白、不翻黑"的降白模式
 - `windows` 引擎的中文需要后处理、数字标点仍会错，且只在 Windows 可用
-- 连续滚动（长图模式）、双页对开、笔记导出到现在都没有，只有页码级进度
+- 连续滚动（长图模式）、**并排双栏对照**（现在只能用标签页切换对照，不能同屏放两本书）、
+  笔记导出到现在都没有，只有页码级进度
 
 ## 本地集成
 
