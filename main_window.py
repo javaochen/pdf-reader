@@ -232,7 +232,15 @@ class MainWindow(QMainWindow):
 
     def _setup_shortcuts(self):
         for key, _name, _desc, cb_name in self.SKEY:
-            self._register_shortcut(key, self._resolve(cb_name))
+            if "." in cb_name:
+                # "viewer.xxx" 里的 viewer 是"当前标签页"指针，切标签页后会换成
+                # 另一个 PdfViewer 实例。若在启动时 getattr，快捷键会永久绑在
+                # 第一个阅读区上：开第二个标签后左右键还在翻旧书（旧书是空白时
+                # 表现为完全没反应）。因此延迟到触发时再解析。
+                callback = lambda name=cb_name: self._resolve(name)()
+            else:
+                callback = self._resolve(cb_name)
+            self._register_shortcut(key, callback)
         # Alt+1…Alt+9 直接切标签页（Ctrl+1/2/0 已被缩放占用）
         for n in range(1, 10):
             self._register_shortcut(f"Alt+{n}", lambda idx=n - 1: self.select_tab(idx))

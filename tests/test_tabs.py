@@ -230,6 +230,20 @@ scs["Ctrl+Tab"].activated.emit()
 check("5.13 触发 Ctrl+Tab 快捷键确实换页签", win.tabs.currentIndex() == 1,
       f"index={win.tabs.currentIndex()}")
 
+# 回归：左右键曾永久绑在启动时的第一个阅读区，开新标签后就翻不动当前页
+cur, other = win.viewer, win.tabs.widget(0)
+cur.goto_page(1)
+other.goto_page(1)
+settle()
+scs["Right"].activated.emit()
+check("5.14 右方向键翻当前标签页的页", cur.current_page_1_based() == 2,
+      f"当前第 {cur.current_page_1_based()} 页")
+scs["Left"].activated.emit()
+check("5.15 左方向键翻当前标签页的页", cur.current_page_1_based() == 1,
+      f"当前第 {cur.current_page_1_based()} 页")
+check("5.16 左右键不会影响其他标签页", other.current_page_1_based() == 1,
+      f"其他标签第 {other.current_page_1_based()} 页")
+
 print()
 print("=" * 78)
 print("6. 上限与失败回滚")
