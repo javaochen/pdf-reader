@@ -25,7 +25,7 @@ os.environ["PDF_READER_CAPTURES_DIR"] = os.path.join(TMP, "captures")
 import app_config  # noqa: E402,F401  # 必须先于 fitz / PySide6：补 Windows 运行库搜索路径
 import fitz  # noqa: E402
 from PySide6.QtCore import Qt  # noqa: E402
-from PySide6.QtGui import QFontMetrics, QShortcut  # noqa: E402
+from PySide6.QtGui import QFontMetrics, QIcon, QShortcut  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
@@ -81,6 +81,13 @@ check("1.4 self.viewer 指向当前标签页的阅读区",
       win.viewer is win.tabs.widget(win.tabs.currentIndex()))
 check("1.5 标签页可关闭、可拖动重排",
       win.tabs.tabsClosable() and win.tabs.isMovable())
+check("1.6 图标文件存在且能加载出尺寸",
+      bool(R.ICON_PATH) and not QIcon(R.ICON_PATH).isNull()
+      and bool(QIcon(R.ICON_PATH).availableSizes()), R.ICON_PATH)
+check("1.7 主窗口自带窗口图标（不依赖入口再设一次）",
+      not win.windowIcon().isNull())
+check("1.8 Windows 下任务栏 AppUserModelID 设置成功",
+      R.set_windows_app_user_model_id() == (os.name == "nt"))
 
 print()
 print("=" * 78)

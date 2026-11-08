@@ -27,11 +27,13 @@ from PySide6.QtGui import QDesktopServices, QFont, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QSpinBox,
@@ -155,6 +157,14 @@ class HelpDialog(QDialog):
             "   - 只改显示配色：自动裁剪判定、无损截取输出都保持原始像素\n"
             "   - 想每次启动就反色：配置里写 \"invert\": true\n"
             "   - 遮挡模式下遮挡块会自动换成浅色，避免在黑底上看不见\n"
+            "13. 导出页码范围（命令面板里搜「导出」）\n"
+            "   - 选起止页，输入导出路径（或点「浏览…」），把连续几页另存为子 PDF\n"
+            "   - 默认路径在原书旁边：书名_p起-止.pdf；改过路径后不再自动改名\n"
+            "   - 不会覆盖正在阅读的原文件；目标已存在时会先问是否覆盖\n"
+            "14. 置顶多本书（命令面板里搜「置顶」）\n"
+            "   - 当前书置顶后，下次启动按配置顺序自动打开；置顶多本 = 启动时开成多个标签页\n"
+            "   - 书单存在 reader_config.json 的 pinned_pdfs；再次执行命令即可取消置顶\n"
+            "   - 置顶书的标签标题前有 ★；超过标签页上限时只打开前 N 本\n"
         )
         layout.addWidget(text)
         btn = QPushButton("关闭")
@@ -380,6 +390,129 @@ class JumpPageDialog(QDialog):
     def accept_page(self):
         self.page = self.spin.value()
         self.accept()
+
+
+class ExportPdfDialog(QDialog):
+    """把当前书的连续几页另存为子 PDF：选起止页 + 直接输入（或浏览）导出路径。
+
+    默认路径放在原书旁边（`书名_p起-止.pdf`）。页面范围变化时，只要路径还是
+    自动生成的，就跟着更新；用户手动改过路径后不再覆盖。
+    """
+
+    def __init__(self, total_pages: int, current_page: int, base_path: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("导出页码范围")
+        self.resize(620, 220)
+        self.total_pages = max(1, int(total_pages))
+        self.base_path = os.path.abspath(base_path)
+        self._output = ""
+        self._auto_path = ""
+
+        layout = QVBoxLayout(self)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("起始页"))
+        self.spin_start = QSpinBox()
+        self.spin_start.setRange(1, self.total_pages)
+        self.spin_start.setValue(max(1, min(int(current_page), self.total_pages)))
+        row.addWidget(self.spin_start)
+        row.addWidget(QLabel("结束页"))
+        self.spin_end = QSpinBox()
+        self.spin_end.setRange(self.spin_start.value(), self.total_pages)
+        self.spin_end.setValue(min(self.total_pages, self.spin_start.value() + 9))
+        row.addWidget(self.spin_end)
+        row.addStretch(1)
+        layout.addLayout(row)
+
+        self.hint = QLabel()
+        self.hint.setStyleSheet("color: #666;")
+        layout.addWidget(self.hint)
+
+        path_row = QHBoxLayout()
+        path_row.addWidget(QLabel("导出路径"))
+        self.path_edit = QLineEdit()
+        path_row.addWidget(self.path_edit, 1)
+        self.btn_browse = QPushButton("浏览…")
+        self.btn_browse.setFocusPolicy(Qt.NoFocus)
+        self.btn_browse.clicked.connect(self._browse)
+        path_row.addWidget(self.btn_browse)
+        layout.addLayout(path_row)
+
+        btns = QHBoxLayout()
+        btns.addStretch(1)
+        ok_btn = QPushButton("导出")
+        cancel_btn = QPushButton("取消")
+        btns.addWidget(ok_btn)
+        btns.addWidget(cancel_btn)
+        layout.addLayout(btns)
+        ok_btn.clicked.connect(self.accept)
+        cancel_btn.clicked.connect(self.reject)
+
+        self.spin_start.valueChanged.connect(self._on_start_changed)
+        self.spin_end.valueChanged.connect(self._on_range_changed)
+        self._on_range_changed()
+
+    # ---- 页码范围 ----
+    def page_range(self):
+        return self.spin_start.value(), self.spin_end.value()
+
+    def output_path(self) -> str:
+        return self._output
+
+    def _default_output(self, start: int, end: int) -> str:
+        stem, _ext = os.path.splitext(self.base_path)
+        return f"{stem}_p{start}-{end}.pdf"
+
+    def _on_start_changed(self, value: int):
+        # 结束页不能早于起始页：调下限时若当前值不够会被自动抬高
+        self.spin_end.setMinimum(value)
+        self._on_range_changed()
+
+    def _on_range_changed(self, *_args):
+        start, end = self.page_range()
+        self.hint.setText(
+            f"共 {self.total_pages} 页；导出第 {start}-{end} 页，共 {end - start + 1} 页")
+        current = self.path_edit.text().strip()
+        is_auto = not current or (
+            self._auto_path
+            and os.path.normcase(os.path.abspath(current))
+            == os.path.normcase(os.path.abspath(self._auto_path)))
+        if is_auto:
+            self._auto_path = self._default_output(start, end)
+            self.path_edit.setText(self._auto_path)
+
+    def _browse(self):
+        path, _filter = QFileDialog.getSaveFileName(
+            self, "导出为 PDF", self.path_edit.text().strip() or self._auto_path,
+            "PDF 文件 (*.pdf)")
+        if path:
+            self.path_edit.setText(path)
+
+    # ---- 确认 ----
+    def accept(self):
+        path = self.path_edit.text().strip()
+        if not path:
+            QMessageBox.warning(self, "无法导出", "请填写导出路径")
+            return
+        path = os.path.abspath(os.path.expanduser(path))
+        if not path.lower().endswith(".pdf"):
+            path += ".pdf"
+        out_dir = os.path.dirname(path)
+        if not os.path.isdir(out_dir):
+            QMessageBox.warning(self, "无法导出", f"目录不存在：\n{out_dir}")
+            return
+        if os.path.normcase(path) == os.path.normcase(self.base_path):
+            QMessageBox.warning(self, "无法导出",
+                                "不能覆盖正在阅读的原文件，请换一个文件名")
+            return
+        if os.path.exists(path):
+            answer = QMessageBox.question(
+                self, "文件已存在", f"要覆盖吗？\n{path}",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if answer != QMessageBox.Yes:
+                return
+        self._output = path
+        super().accept()
 
 
 class CommandDialog(QDialog):

@@ -7,5 +7,6 @@
   "notes_file": "notes.md",
   "invert": false,
   "captures_dir": "captures",
-  "captures_max": 200
+  "captures_max": 200,
+  "pinned_pdfs": []
 }

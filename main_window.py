@@ -8,6 +8,8 @@ import os
 from app_config import (
     CAPTURES_DIR,
     CAPTURES_MAX,
+    CONFIG_PATH,
+    ICON_PATH,
     INITIAL_PAGE,
     INITIAL_PDF_KEYWORD,
     MAX_TABS,
@@ -16,7 +18,9 @@ from app_config import (
     PdfEntry,
     STATE_DIR,
     STATE_SAVE_DEBOUNCE_MS,
+    load_pinned_pdfs,
     log,
+    save_pinned_pdfs,
 )
 from stores import CaptureStore, HistoryStore, RecentStore
 from ui_panels import (
@@ -24,6 +28,7 @@ from ui_panels import (
     BookmarkPanel,
     CapturePanel,
     CommandDialog,
+    ExportPdfDialog,
     HelpDialog,
     JumpPageDialog,
     NotesPanel,
@@ -33,12 +38,13 @@ from ui_panels import (
 from viewer import PdfViewer
 
 from PySide6.QtCore import QTimer, Qt
-from PySide6.QtGui import QFontMetrics, QGuiApplication, QKeySequence, QPixmap, QShortcut
+from PySide6.QtGui import QFontMetrics, QGuiApplication, QIcon, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
     QFileDialog,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QSplitter,
     QTabWidget,
@@ -49,6 +55,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Python PDF Reader")
+        self._apply_window_icon()
         self.resize(1280, 920)
 
         # 使窗口居中于可用屏幕区域内，避免被任务栏遮挡，顺便隐藏顶部框
@@ -121,12 +128,47 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._setup_shortcuts()
 
+        self.pinned = load_pinned_pdfs()
+        self._open_startup_books()
+
+    def _open_startup_books(self):
+        """启动时优先按配置顺序打开置顶书；没有可用的置顶书才退回旧逻辑。"""
+        existing = [p for p in self.pinned if os.path.isfile(p)]
+        if self.pinned and not existing:
+            self.status.showMessage("置顶的 PDF 都不存在，已按默认规则打开")
+        opened = 0
+        for path in existing:
+            if opened >= MAX_TABS:
+                break
+            ok = self.open_pdf(path) if opened == 0 else self.open_in_new_tab(path)
+            if ok:
+                opened += 1
+        if opened:
+            if opened < len(existing):
+                self.status.showMessage(
+                    f"已打开 {opened} 本置顶 PDF（超过标签页上限 {MAX_TABS}，其余未打开）")
+            self.tabs.setCurrentIndex(0)
+            return
         if INITIAL_PDF_KEYWORD:
             p = self.pick_pdf_by_keyword(INITIAL_PDF_KEYWORD)
             if p:
                 self.open_pdf(p)
         elif self.pdf_entries:
             self.open_pdf(self.pdf_entries[0].path)
+
+    def _apply_window_icon(self):
+        """在构造时设置窗口图标，不依赖入口是否记得调用 setWindowIcon。
+
+        Windows 任务栏还要靠 AppUserModelID（见 app_config），否则系统会按
+        pythonw.exe 猜应用身份，偶发显示 Python 默认图标或分组错乱。
+        """
+        if not ICON_PATH:
+            return
+        icon = QIcon(ICON_PATH)
+        if icon.isNull():
+            log.warning("图标加载失败：%s", ICON_PATH)
+            return
+        self.setWindowIcon(icon)
 
     def scan_pdf_files(self, root_dir: str) -> List[PdfEntry]:
         entries = []
@@ -199,6 +241,8 @@ class MainWindow(QMainWindow):
     # 只放"没有快捷键"的命令：有键位的统一在 SKEY 里登记，否则命令面板会出现两条一样的
     EXTRA_COMMANDS = [
         ("打开文件",        "打开任意目录的PDF 文件",                    "open_dialog"),
+        ("导出页码范围",    "把当前书连续几页另存为子 PDF（自选路径）",  "export_pdf_dialog"),
+        ("置顶/取消置顶当前书", "启动时自动打开置顶的书（可多本，存入 reader_config.json）", "toggle_pin_current"),
         ("适应页面开关",    "在 适合页面/适合宽度 之间切换",     "toggle_fit_page_mode"),
         ("显示/隐藏书签栏", "切换左侧书签面板",                 "toggle_bookmark_panel"),
         ("插入位置标记",    "在速记里记下当前书名与页码",       "notes_insert_marker"),
@@ -325,6 +369,36 @@ class MainWindow(QMainWindow):
         path = os.path.abspath(self.viewer.current_path)
         QGuiApplication.clipboard().setText(path)
         self.status.showMessage(f"已复制路径：{path}")
+
+    def _is_pinned(self, path: str) -> bool:
+        if not path:
+            return False
+        key = os.path.normcase(os.path.abspath(path))
+        return any(os.path.normcase(p) == key for p in self.pinned)
+
+    def toggle_pin_current(self):
+        """置顶/取消置顶当前书，写回 reader_config.json，下次启动自动打开。"""
+        path = self.viewer.current_path
+        if not path:
+            self.status.showMessage("当前没有打开 PDF，无法置顶")
+            return
+        path = os.path.abspath(path)
+        pinned = load_pinned_pdfs()
+        key = os.path.normcase(path)
+        if any(os.path.normcase(p) == key for p in pinned):
+            pinned = [p for p in pinned if os.path.normcase(p) != key]
+            action = "取消置顶"
+        else:
+            pinned.append(path)
+            action = "置顶"
+        if not save_pinned_pdfs(pinned):
+            self.status.showMessage(f"{action}失败：无法写入配置文件 {CONFIG_PATH}")
+            return
+        self.pinned = load_pinned_pdfs()
+        self._update_all_tab_titles()
+        name = os.path.splitext(os.path.basename(path))[0]
+        self.status.showMessage(
+            f"已{action}：{name}（共 {len(self.pinned)} 本，下次启动自动打开）")
 
     @staticmethod
     def _fmt_toc_ul(toc):
@@ -493,9 +567,31 @@ class MainWindow(QMainWindow):
         # 否则"跳页后回车没反应"（实测焦点会变成 None）
         self.restore_crop_focus()
 
-    def open_pdf(self, path: str, explicit_page: Optional[int] = None):
+    def export_pdf_dialog(self):
+        """命令面板：把当前书的连续页另存为子 PDF，路径由用户输入。"""
+        viewer = self.viewer
+        if not viewer.doc or not viewer.current_path:
+            self.status.showMessage("当前没有打开 PDF")
+            return
+        dlg = ExportPdfDialog(viewer.total_pages(),
+                              viewer.current_page_1_based(),
+                              viewer.current_path, self)
+        if dlg.exec() == QDialog.Accepted:
+            start, end = dlg.page_range()
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                ok, msg = viewer.export_pages(start, end, dlg.output_path())
+            finally:
+                QApplication.restoreOverrideCursor()
+            if ok:
+                self.status.showMessage(msg)
+            else:
+                QMessageBox.critical(self, "导出失败", msg)
+        self.restore_crop_focus()
+
+    def open_pdf(self, path: str, explicit_page: Optional[int] = None) -> bool:
         """在当前标签页里打开/切换文件（Ctrl+O 走这条路）。"""
-        self._open_in(self.viewer, path, explicit_page)
+        return self._open_in(self.viewer, path, explicit_page)
 
     def _open_in(self, viewer: PdfViewer, path: str,
                  explicit_page: Optional[int] = None) -> bool:
@@ -622,15 +718,18 @@ class MainWindow(QMainWindow):
             return
         name = os.path.splitext(os.path.basename(path))[0]
         page = viewer.current_page_1_based()
+        pinned = self._is_pinned(path)
         # 标题带页码：同一本书开两个标签对照时，标题才分得清
-        title = f"{name} · {page}"
+        title = f"{'★ ' if pinned else ''}{name} · {page}"
         # 一个超长书名不该把整条页签栏占满：按像素宽度中间省略，
         # 开头（书名）与结尾（页码）都留着；完整路径和页数进 tooltip
         metrics = QFontMetrics(self.tabs.tabBar().font())
         self.tabs.setTabText(
             index, metrics.elidedText(title, Qt.ElideMiddle, self.TAB_TITLE_MAX_PX))
-        self.tabs.setTabToolTip(
-            index, f"{path}\n第 {page} / {viewer.total_pages()} 页")
+        tip = f"{path}\n第 {page} / {viewer.total_pages()} 页"
+        if pinned:
+            tip += "\n★ 已置顶：下次启动自动打开"
+        self.tabs.setTabToolTip(index, tip)
 
     def _update_all_tab_titles(self):
         for i in range(self.tabs.count()):

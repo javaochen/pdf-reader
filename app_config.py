@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from typing import Dict
+from typing import List
 import json
 import logging
 import os
@@ -70,7 +71,8 @@ _preload_newer_msvc_runtime()
 #     assets/reader.ico   窗口图标
 APP_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = APP_DIR / "assets"
-CONFIG_PATH = APP_DIR / "reader_config.json"
+# 测试/打包可用 PDF_READER_CONFIG_PATH 指向临时配置，避免改动用户真实配置
+CONFIG_PATH = Path(os.environ.get("PDF_READER_CONFIG_PATH") or (APP_DIR / "reader_config.json"))
 
 
 def load_config() -> Dict[str, Any]:
@@ -103,6 +105,78 @@ def _cfg_bool(key: str, default: bool) -> bool:
     if isinstance(raw, bool):
         return raw
     return str(raw).strip().lower() in ("1", "true", "yes", "on", "y", "是", "开")
+
+
+def save_config(**updates) -> bool:
+    """把部分配置写回 reader_config.json，只改传入的键。
+
+    先写同目录临时文件再原子替换：写失败返回 False，界面据此提示；
+    配置文件存在但无法解析时拒绝写入，避免把用户手写的其他键覆盖掉。
+    """
+    data: Dict[str, Any] = {}
+    if CONFIG_PATH.is_file():
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            log.warning("配置文件无法解析，拒绝覆盖写入：%s", CONFIG_PATH, exc_info=True)
+            return False
+        if not isinstance(data, dict):
+            log.warning("配置文件顶层不是对象，拒绝覆盖写入：%s", CONFIG_PATH)
+            return False
+
+    data.update(updates)
+    tmp = CONFIG_PATH.with_name(f".{CONFIG_PATH.name}.{os.getpid()}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+        os.replace(tmp, CONFIG_PATH)
+    except OSError:
+        log.warning("写入配置失败：%s", CONFIG_PATH, exc_info=True)
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+    CONFIG.update(updates)
+    return True
+
+
+PINNED_KEY = "pinned_pdfs"
+
+
+def pinned_pdf_paths(raw=None) -> List[str]:
+    """规范置顶列表：去空、去重、保序；相对路径按程序目录解析。"""
+    if raw is None:
+        raw = CONFIG.get(PINNED_KEY, [])
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    out: List[str] = []
+    seen = set()
+    for item in raw:
+        if not isinstance(item, str) or not item.strip():
+            continue
+        p = Path(item.strip()).expanduser()
+        if not p.is_absolute():
+            p = APP_DIR / p
+        abs_path = os.path.abspath(p)
+        key = os.path.normcase(abs_path)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(abs_path)
+    return out
+
+
+def load_pinned_pdfs() -> List[str]:
+    """读取配置里的置顶书单（启动时按这个顺序打开）。"""
+    return pinned_pdf_paths()
+
+
+def save_pinned_pdfs(paths) -> bool:
+    return save_config(**{PINNED_KEY: pinned_pdf_paths(paths)})
 
 
 def default_downloads_dir() -> Path:
@@ -189,6 +263,33 @@ CAPTURE_MAX_BYTES = 512 * 1024 * 1024
 
 # 图标优先用包内 assets/reader.ico（随包发布）；缺失时返回空串，使用 Qt 默认图标
 ICON_PATH = str(ASSETS_DIR / "reader.ico") if (ASSETS_DIR / "reader.ico").is_file() else ""
+
+# Windows 任务栏按 AppUserModelID 分组。不设置时系统会按解释器（pythonw.exe）
+# 猜应用身份，偶发显示 Python 默认图标、或同一程序被分成两组——窗口图标本身
+# 其实已经设了（2026-11 排查：reader.ico 路径与尺寸均正常）。必须在创建
+# QApplication 之前调用才生效。
+APP_USER_MODEL_ID = "PdfReader.App.1"
+
+
+def set_windows_app_user_model_id(app_id: str = APP_USER_MODEL_ID) -> bool:
+    """设置 Windows 任务栏的应用身份；非 Windows 或失败返回 False，不影响启动。"""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        shell32 = ctypes.windll.shell32
+        shell32.SetCurrentProcessExplicitAppUserModelID.argtypes = [ctypes.c_wchar_p]
+        shell32.SetCurrentProcessExplicitAppUserModelID.restype = ctypes.c_long
+        hr = shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+        if hr != 0:
+            log.warning("设置 AppUserModelID 失败：HRESULT=0x%08X", hr & 0xFFFFFFFF)
+            return False
+        return True
+    except Exception:
+        log.debug("设置 AppUserModelID 失败", exc_info=True)
+        return False
+
+
 HISTORY_VERSION = 3
 
 

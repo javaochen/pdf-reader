@@ -837,6 +837,53 @@ class PdfViewer(QWidget):
     def total_pages(self) -> int:
         return self.doc.page_count if self.doc else 0
 
+    def export_pages(self, start_1_based: int, end_1_based: int,
+                     out_path: str) -> Tuple[bool, str]:
+        """把 [start, end] 连续页另存为新的 PDF，不改动当前文档。
+
+        返回 (是否成功, 给用户看的提示)。先写到同目录临时文件再原子替换：
+        中途失败既不会留下半截 PDF，也不会破坏已存在的同名文件。
+        """
+        if not self.doc or not self.current_path:
+            return False, "当前没有打开 PDF"
+        total = self.doc.page_count
+        try:
+            start, end = int(start_1_based), int(end_1_based)
+        except (TypeError, ValueError):
+            return False, "页码范围必须是整数"
+        if not (1 <= start <= end <= total):
+            return False, f"页码范围无效：应为 1-{total} 之间的连续页（起始 ≤ 结束）"
+
+        out = os.path.abspath(os.path.expanduser(str(out_path).strip()))
+        if not out.lower().endswith(".pdf"):
+            out += ".pdf"
+        if os.path.normcase(out) == os.path.normcase(os.path.abspath(self.current_path)):
+            return False, "不能覆盖正在阅读的原文件，请换一个文件名"
+        out_dir = os.path.dirname(out)
+        if not os.path.isdir(out_dir):
+            return False, f"导出目录不存在：{out_dir}"
+
+        tmp = os.path.join(out_dir, f".{os.path.basename(out)}.{os.getpid()}.part")
+        try:
+            with self._doc_lock:
+                part = fitz.open()
+                try:
+                    part.insert_pdf(self.doc, from_page=start - 1, to_page=end - 1)
+                    part.save(tmp, garbage=3, deflate=True)
+                finally:
+                    part.close()
+            os.replace(tmp, out)
+        except Exception as e:
+            log.error("导出 PDF 失败：%s", out, exc_info=True)
+            return False, f"导出失败：{e}"
+        finally:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                log.debug("清理导出临时文件失败：%s", tmp, exc_info=True)
+        return True, f"已导出 {end - start + 1} 页：{out}"
+
     def current_page_1_based(self) -> int:
         return self.current_page_index + 1
 

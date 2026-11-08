@@ -52,6 +52,11 @@
   只改显示配色——**截取输出与去白边判定仍按原始像素**，发给 AI 的图永远是白底黑字
 - **右侧栏（`Ctrl+N` 速记 / `Ctrl+Shift+X` 截取暂存）**：默认不占地方，按需打开；
   暂存页把每次截取的图连出处一起列成缩略图，**点一下即复制**，支持批量清理
+- **导出页码范围**：命令面板（`Ctrl+P`）搜「导出」，选起止页并输入（或点「浏览…」）导出路径，
+  把连续几页另存为子 PDF；默认路径在原书旁边（`书名_p起-止.pdf`），手动改过路径后不再自动改名；
+  不会覆盖正在阅读的原文件，目标已存在时会先问是否覆盖
+- **置顶多本书**：命令面板搜「置顶」，把当前书加入/移出置顶书单并写入 `reader_config.json`；
+  下次启动按书单顺序自动打开成标签页（受标签页上限约束），置顶标签标题前有 ★
 - 书签目录导航、阅读进度自动恢复、书签导出 Markdown、命令面板（**可按名称/说明/快捷键搜索**）、快速切换 PDF
 - 发布友好：不含任何机器路径，默认扫描**你自己**的「下载」文件夹，配置见下
 
@@ -90,6 +95,7 @@ copy reader_config.example.json reader_config.json     # Windows
 | `invert` | `PDF_READER_INVERT` | `false` | 启动即反色显示（夜间看扫描件） |
 | `initial_pdf_keyword` | `PDF_READER_INITIAL_PDF_KEYWORD` | 空 | 启动时按文件名关键字自动打开 |
 | `initial_page` | `PDF_READER_INITIAL_PAGE` | `1` | 无历史记录时的起始页 |
+| `pinned_pdfs` | 无 | `[]` | 置顶书单（绝对路径数组）；启动时按顺序打开，可用命令面板「置顶/取消置顶当前书」增删 |
 
 其余性能参数（缓存上限、DPI、防抖、`max_tabs` 等）见 [docs/USAGE.md](docs/USAGE.md)。
 
@@ -125,7 +131,7 @@ pdf_reader/
 ├─ assets/reader.ico            # 窗口图标
 ├─ docs/                        # 使用说明 / 设计文档 / 截图
 ├─ captures/                    # 截取暂存（运行时创建，已 gitignore）
-├─ tests/                       # 九套无头回归测试（256 项）
+├─ tests/                       # 十一套无头回归测试（334 项）
 └─ tools/make_screenshots.py    # 重新生成 README 截图
 ```
 

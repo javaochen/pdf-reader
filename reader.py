@@ -43,6 +43,7 @@ from app_config import (
     CAPTURE_MAX_BYTES,
     ICON_PATH,
     HISTORY_VERSION,
+    set_windows_app_user_model_id,
     AUTO_CROP_DEFAULT,
     AUTO_CROP_WHITE_THRESHOLD,
     AUTO_CROP_MIN_SIZE,
@@ -93,6 +94,7 @@ from ui_panels import (
     BookmarkCopyDialog,
     QuickSwitchDialog,
     JumpPageDialog,
+    ExportPdfDialog,
     CommandDialog,
     BookmarkPanel,
     NotesPanel,
@@ -104,18 +106,18 @@ from viewer import (
 )
 from main_window import MainWindow
 
-from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
 
 def main():
+    # 必须在创建 QApplication 之前：Windows 任务栏按 AppUserModelID 分组，
+    # 不设置时系统会按 pythonw.exe 猜应用身份，偶发显示 Python 默认图标。
+    set_windows_app_user_model_id()
     app = QApplication(sys.argv)
-    icon = QIcon(ICON_PATH) if ICON_PATH else QIcon()
+    win = MainWindow()
+    icon = win.windowIcon()
     if not icon.isNull():
         app.setWindowIcon(icon)
-    win = MainWindow()
-    if not icon.isNull():
-        win.setWindowIcon(icon)
     win.show()
     sys.exit(app.exec())
 

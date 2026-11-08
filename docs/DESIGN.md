@@ -72,6 +72,9 @@
 | 上限保护 | 单次跨页截取最多 50 页、输出最多 2 亿像素，超限直接提示而不是拼出 GB 级位图 |
 | 标签页 | 一个标签页一个 `PdfViewer`：文档、页码、缩放、截取状态天然隔离，`self.viewer` 只作为"当前标签页"指针由 `_on_tab_changed` 统一同步。切走的标签立即释放页面缓存与屏幕上那张位图（只清 QLabel 的位图、不动标签尺寸，滚动位置才不会跳回顶部），文档与内容框缓存保留，切回来重渲染但不重算白边。上限 `MAX_TABS`（默认 8）；标题按 `TAB_TITLE_MAX_PX`（200px）中间省略，长书名不撑满页签栏 |
 | 命令面板 | 动作表只有一个来源：`SKEY`（有键位）+ `EXTRA_COMMANDS`（无键位）；`get_command_actions()` 按回调去重，重复时优先保留带键位的那条，所以同一个功能不会出现两次。面板支持名称/说明/快捷键三处匹配、空格分词、↑↓ 选择、回车执行 |
+| 导出子 PDF | `PdfViewer.export_pages()` 用 `insert_pdf(from_page, to_page)` 生成新文档；写盘先落到同目录 `.part` 再 `os.replace`，失败不留半截文件、不破坏已有同名文件；拒绝覆盖正在阅读的原文件（Windows 上原文件句柄被 MuPDF 占用） |
+| 图标与任务栏 | 启动时在 `QApplication` 之前调用 `SetCurrentProcessExplicitAppUserModelID`：不设置时 Windows 按 `pythonw.exe` 猜应用身份，偶发显示 Python 默认图标或分组错乱。窗口图标在 `MainWindow` 构造时就加载 `assets/reader.ico`，不依赖入口是否再设一次 |
+| 置顶书单 | `reader_config.json` 的 `pinned_pdfs` 保存绝对路径列表；启动时按顺序开成标签页（跳过不存在文件、超过 `max_tabs` 只开前 N 本），全不可用时退回"关键字/目录第一本"旧逻辑。写回只改这一个键，先写临时文件再 `os.replace`；配置损坏或顶层非对象时拒绝写入，避免覆盖用户手写的其他配置 |
 
 ## 实测数据
 
@@ -89,7 +92,7 @@
 
 ## 测试
 
-九套无头回归测试，**不需要显示器**（自动用 Qt `offscreen` 平台），共 256 项。
+十一套无头回归测试，**不需要显示器**（自动用 Qt `offscreen` 平台），共 334 项。
 测试会把 PDF 目录、状态目录、速记文件与截取暂存都指向包内临时目录，不会扫描或写入用户的真实数据。
 
 ```bash
@@ -98,9 +101,11 @@ python tests/test_capture_autocrop.py  # 截取/自动裁剪/缓存/防抖/上�
 python tests/test_math_reading.py      # 原生分辨率/抗噪阈值/预取/视图模式（24 项）
 python tests/test_invert.py            # 反色只影响显示、不污染截取（23 项）
 python tests/test_notes.py             # 速记自动落盘/防抖/右侧栏开关（25 项）
-python tests/test_captures.py          # 截取暂存：落盘/索引/清理/面板交互（26 项）
-python tests/test_tabs.py              # 标签页：独立状态/标签内换书/缓存释放/上限/标题省略（59 项）
+python tests/test_captures.py          # 截取暂存：落盘/索引/清理/面板交互（36 项）
+python tests/test_tabs.py              # 标签页：独立状态/标签内换书/缓存释放/上限/标题省略/图标（65 项）
 python tests/test_commands.py          # 命令面板：动作去重/搜索/键盘执行（24 项）
+python tests/test_export.py            # 导出页码范围：内容/非法范围/路径/覆盖确认（36 项）
+python tests/test_pinned.py            # 置顶书单：启动顺序/缺失/上限/写回配置（26 项）
 python tests/test_nav.py               # 书签相对导航（12 例）
 ```
 
